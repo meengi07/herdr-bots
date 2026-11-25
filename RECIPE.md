@@ -10,34 +10,34 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
 - Sidebar (layout `bots`, Herdr's `main` tree): Spaces, then a `bots` block of 230px, then Agents.
   - "Bots" header (11.5px, `dim`) with `+` (new bot, inline name input) and a fold chevron.
   - One 30px row per bot: 16px lamb icon in a 1px ring of the bot's color, title (`foreground`, or `muted` when off),
-    a status or schedule line (11.5px), a 6px dot: `blocked` "응답 필요", `working` "작업 중", `done` "완료",
+    a status or schedule line (11.5px), a 6px dot: `blocked` "needs you", `working` "working", `done` "done",
     `idle` with the schedule text, hollow ring when off. Right-click: a 240×132 popup with Open chat, Rename, Remove
     bot (asks once more, in `blocked` color).
   - "Rooms" header with `+` (creates an untitled room at once), one row per room: overlapping 14px dots of member colors,
     title ("Untitled room" in `muted` when empty), an unread count, a dot in `working` or `blocked` when a member is or
     a bot asked `@user`. Right-click: Open, Rename, Leave room (asks once more).
-  - Every label is chosen from the macOS language (`defaults read -g AppleLanguages`): Korean or English.
+  - Labels are English, or Korean when it is the first macOS language (`defaults read -g AppleLanguages`).
 - Bot chat window (`kind: "window"`, 520×680, key `chat-<bot>`): 52px header with the lamb and a status badge, title,
-  model chip, "대화", "터미널 보기", `–` minimize (to 320×52) and `✕`. Messages in a 760px column with date dividers;
-  your bubble `selected`, 18px radius; bot rows: 28px lamb, name, time, "복사", a tool chip
-  "▸ 도구 N회 · names" that unfolds one line per call; a working line; a blocked card. Composer: auto-growing textarea
+  model chip, "Chats", "Terminal", `–` minimize (to 320×52) and `✕`. Messages in a 760px column with date dividers;
+  your bubble `selected`, 18px radius; bot rows: 28px lamb, name, time, "Copy", a tool chip
+  "▸ N tool calls · names" that unfolds one line per call; a working line; a blocked card. Composer: auto-growing textarea
   (2–8 rows), send `↑`, stop `■` while working.
-- Room window (620×720, key `room-<room>`): title, member dots, "봇 N", "+ 봇 추가". Bot bubbles in a 6% tint of the
-  bot's color, name in that color, a 26px lamb in a 2px ring. Hand-offs show as a pill "A → B 전달 · n/6". Mentions in
+- Room window (620×720, key `room-<room>`): title, member dots, "N bots", "+ Add bot". Bot bubbles in a 6% tint of the
+  bot's color, name in that color, a 26px lamb in a 2px ring. Hand-offs show as a pill "A → B · n/3" (rounds). Mentions in
   messages are links (`bot:<id>`) that open that bot's chat. Composer mention buttons are outlined in the bot's color
   and insert a colored token at the end.
 - Colors: Okabe-Ito `#0072B2 #E69F00 #009E73 #CC79A7 #D55E00 #56B4E9` by bot id order.
 
 ## How it behaves
 
-- working: the window shows "작업 중 · m:ss · <what the bot reports> · 워커 N개"; blocked: a card with the bot's
-  question and "터미널에서 답하기" (`terminal.peek`); done/idle: nothing extra.
-- Sending: the bubble appears at once ("보내는 중"), `hc send` runs in the background; an off bot is started first.
+- working: the window shows "Working · m:ss · <what the bot reports> · N workers running"; blocked: a card with the bot's
+  question and "Answer in terminal" (`terminal.peek`); done/idle: nothing extra.
+- Sending: the bubble appears at once ("sending"), `hc send` runs in the background; an off bot is started first.
 - New replies scroll to the start of the reply; your message scrolls to the end.
 - Rooms: your message goes to `@mentioned` members, else the first member (host). Each member answers in a room-only
   session and wakes with what was said since its last reply as `<quoted_room_history>`. A reply's `@mentions` of other
   members are delivered next, up to 3 rounds and 10 bot replies per message (then a Continue card, up to 5 times). A bot
-  mentioning the bot that called it does not wake it. `quiet` or `조용` stays silent; `@user` marks "needs you".
+  mentioning the bot that called it does not wake it. `quiet` stays silent; `@user` marks "needs you".
 - Room window: click the title to rename; the member panel shows the host, "Make host", "Remove" and model choices;
   "■ Stop" appears while a member works.
 - Memory: a `UserPromptSubmit` hook adds `SOUL.md` / `MEMORY.md` changes to the next turn; every 5 turns a background

@@ -6,8 +6,8 @@ work to each other, scheduled runs and desktop notifications. Inspired by Orca B
 
 ![herdr-bots](preview.png)
 
-> The UI follows the macOS language: Korean when Korean is first, English otherwise. Bot rules and templates are English;
-> bots reply in your language.
+> The UI is English, with a Korean translation used when Korean is your first macOS language. Bots reply in the
+> language you write in.
 
 ## What you get
 
@@ -19,7 +19,7 @@ work to each other, scheduled runs and desktop notifications. Inspired by Orca B
 - **Rooms**: `+` creates a room at once and opens it with the bot picker; name it later by clicking its title or from
   the right-click menu, which also has "Leave room" (its history is kept). The member panel sets the host and removes
   bots. Several bots in one chat. A message goes to the bots you `@mention` (or the first member, the room
-  owner). A bot that `@mentions` another bot hands the turn to it, at most 6 hand-offs per message.
+  owner). A bot that `@mentions` another bot hands the turn to it (limits below).
 - **Self-updating persona and memory**: every turn, a Claude Code hook compares the bot's `SOUL.md` and `MEMORY.md`
   with what that session last saw and adds the change to the turn. Every 5 turns a background reflection proposes
   edits from the conversation; `botsmem` checks them (owner rules untouchable, at most 25% of memory lines removed per
@@ -75,7 +75,7 @@ the chat shows a card, press "answer in terminal" and accept.
 | `botsmem history <name>` / `botsmem undo <name> [id]` | see or undo persona and memory changes |
 
 Model and effort per bot: `botsdb set-model <bot> <model> <effort>` (default `claude-sonnet-5-5`, `low`), or the chat window's model chip. Environment overrides: `HERDR_BOT_MODEL`, `HERDR_BOT_EFFORT`,
-`HERDR_BOT_PERMISSION` (`auto`). Notification language: `mods/desktop-toast/config.json` (`ko` or `en`).
+`HERDR_BOT_PERMISSION` (`auto`). Notification language: `mods/desktop-toast/config.json` (`auto` follows the UI, or `en` / `ko`).
 
 ## How it works
 
