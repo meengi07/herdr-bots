@@ -86,7 +86,7 @@ Model and effort per bot: `botsdb set-model <bot> <model> <effort>` (default `cl
 | 1:1 chat history | Claude Code's own transcript (`~/.claude/projects/<bot folder>/*.jsonl`), read only |
 | Bots, sessions index, rooms, room messages | `~/.herdr-bots/bots.db` (SQLite) through `botsdb`, which binds every value as a SQL parameter |
 | Persona and memory upkeep | `botsmem`, called by the bot folder's Claude Code hooks (`UserPromptSubmit`, `Stop`) |
-| Room relay | the Bots sidebar mod, every 1.5 s and right after you post. A `send` row is unique per (room, message, bot), so a message is never delivered twice |
+| Room relay | the Bots sidebar mod, when the database or a bot transcript changes; every 1.5 s only while a reply or DM is waiting, else every 30 s. One `botsdb relay-snapshot` call per pass. A `send` row is unique per (room, message, bot), so a message is never delivered twice |
 
 ## Security and privacy
 

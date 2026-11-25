@@ -20,6 +20,7 @@ Values are always bound as SQL parameters (user text is never read as SQL). Outp
   botsdb room-read <room> [after]     room info + events with seq > after
   botsdb room-append <room> <json>... add events. send/done are unique per (room, kind, message id, bot); a repeat is ignored -> {"inserted":[true|false,...]}
   botsdb room-members <room>          members and their room-only Claude session ids [{bot, session}] (created when missing)
+  botsdb relay-snapshot               what one relay pass needs: {rooms:[room + {meta, events, sessions}], dms:{queued, sent}}
   botsdb chat-session <bot>           the bot's 1:1 session id (newest transcript, room sessions excluded) -> {"id"} | {"id": null}
   botsdb room-touch <room> <bot>      set that member's last room-session activity to now
   botsdb room-idle <minutes>          room sessions idle longer than that [{room, bot, session}]
@@ -264,6 +265,16 @@ def event_json(r):
     return e
 
 
+def room_read(db, room, after=0):
+    meta = db.execute("select title, archived from rooms where id = ?", (room,)).fetchone()
+    events = [event_json(r) for r in db.execute("select * from room_events where room = ? and seq > ? order by seq", (room, after))]
+    return {"meta": {"title": meta["title"] if meta else "", "members": members(db, room), "archived": bool(meta and meta["archived"])}, "events": events}
+
+
+def dm_list(db, state):
+    return [dict(r) for r in db.execute("select * from dms where state = ? order by at", (state,))]
+
+
 def append(db, room, event):
     cur = db.execute(
         "insert or ignore into room_events (room, kind, msg_id, sender, bot, body, hop, reply_to, reply, silent, at, root, needs) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -371,11 +382,7 @@ def main(argv):
         db.commit()
         out({"members": members(db, args[0])})
     elif cmd == "room-read":
-        room = args[0]
-        after = int(args[1]) if len(args) > 1 else 0
-        meta = db.execute("select title, archived from rooms where id = ?", (room,)).fetchone()
-        events = [event_json(r) for r in db.execute("select * from room_events where room = ? and seq > ? order by seq", (room, after))]
-        out({"meta": {"title": meta["title"] if meta else "", "members": members(db, room), "archived": bool(meta and meta["archived"])}, "events": events})
+        out(room_read(db, args[0], int(args[1]) if len(args) > 1 else 0))
     elif cmd == "room-append":
         room = args[0]
         inserted = [append(db, room, json.loads(raw)) for raw in args[1:]]
@@ -383,6 +390,10 @@ def main(argv):
         out({"inserted": inserted})
     elif cmd == "room-members":
         out(room_members(db, args[0]))
+    elif cmd == "relay-snapshot":
+        # One process per relay pass instead of 3 + 2 per room: starting python3 costs far more than these queries.
+        out({"rooms": [{**room, **room_read(db, room["id"]), "sessions": room_members(db, room["id"])} for room in rooms(db)],
+             "dms": {"queued": dm_list(db, "queued"), "sent": dm_list(db, "sent")}})
     elif cmd == "chat-session":
         files = chat_files(db, args[0])
         out({"id": os.path.basename(files[0])[:-6] if files else None, "file": files[0] if files else None})
@@ -401,7 +412,7 @@ def main(argv):
     elif cmd == "dm-send":
         out(dm_send(db, args[0], args[1].lstrip("@"), args[2]))
     elif cmd == "dm-list":
-        out([dict(r) for r in db.execute("select * from dms where state = ? order by at", (args[0],))])
+        out(dm_list(db, args[0]))
     elif cmd == "dm-mark":
         dm_id, state, reply = args[0], args[1], (args[2] if len(args) > 2 else None)
         db.execute("update dms set state = ?, reply = coalesce(?, reply), done_at = case when ? = 'done' then ? else done_at end where id = ?",

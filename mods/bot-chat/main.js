@@ -119,7 +119,9 @@ export default class BotChat extends View {
     });
     // Fallback check, and refresh of the elapsed time and status line while working.
     cx.timer.every(2000, (cx) => cx.spawn(async (cx) => {
-      await this.refresh(cx, true);
+      const status = this.status();
+      // Transcript changes already refresh; poll only while the bot works or every 30 s.
+      if (status === "working" || status === "blocked" || Date.now() - (this.loadedAt ?? 0) > 30_000) await this.refresh(cx, true);
       if (this.pendingRestart && this.status() !== "working") await this.applyModel(cx);
     }));
     cx.spawn(async (cx) => { await this.loadConfig(); cx.notify(); });
@@ -144,6 +146,7 @@ export default class BotChat extends View {
   }
 
   async load() {
+    this.loadedAt = Date.now();
     // The current conversation (no view) is the newest 1:1 session, room sessions excluded.
     if (!this.view && (!this.chatSessionAt || Date.now() - this.chatSessionAt > 5000)) {
       const found = await exec(BOTSDB(home()), ["chat-session", this.bot]);

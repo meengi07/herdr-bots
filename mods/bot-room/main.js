@@ -59,6 +59,8 @@ export default class BotRoom extends View {
       for (;;) {
         const changed = await watchFolder(`${home()}/.herdr-bots`).catch(() => null);
         if (changed === null) return;
+        // Reads touch bots.db-shm (ours and the sidebar's); only writes (bots.db-wal) mean new events.
+        if (changed.length && changed.every((path) => path.endsWith("-shm"))) continue;
         if (!this.loadingNow) { this.loadingNow = true; try { if (await this.load()) cx.notify(); } finally { this.loadingNow = false; } }
       }
     });
@@ -66,12 +68,16 @@ export default class BotRoom extends View {
     // Fallback check, and status refresh while members work. A bot waiting for a model change is restarted once it is idle.
     cx.timer.every(2000, (cx) => cx.spawn(async (cx) => {
       for (const bot of [...this.pendingRestart]) if (botStatus(bot) !== "working") await this.applyModel(bot, cx);
-      const changed = this.loadingNow ? false : await this.load();
-      if (changed || this.meta.members.some((b) => botStatus(b) === "working")) cx.notify();
+      const working = this.meta.members.some((b) => botStatus(b) === "working");
+      // Folder changes already reload; read here only while a member works or every 30 s, since each read starts a python3 process.
+      const due = working || Date.now() - (this.loadedAt ?? 0) > 30_000;
+      const changed = this.loadingNow || !due ? false : await this.load();
+      if (changed || working) cx.notify();
     }));
   }
 
   async load() {
+    this.loadedAt = Date.now();
     const read = await botsdb("room-read", this.room, String(this.seq));
     const meta = read.meta;
     // The read right after sending and the read on a folder change can overlap and return the same event; drop numbers already seen.

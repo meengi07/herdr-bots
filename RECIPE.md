@@ -74,6 +74,9 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
 - Room sessions live in the bot's folder too, so "the newest transcript" may be a room: look up the 1:1 session with
   `botsdb chat-session` (also for `--resume`; `--continue` can pick a room session).
 - Two reads of the room (after sending and on a folder change) can overlap: drop events at or below the last seen `seq`.
+- Every read of `bots.db` touches `bots.db-shm`, which `watchFolder` reports: ignore batches of only `-shm` paths or the relay
+  wakes itself in a loop (measured: 377 `botsdb` processes in 45 s while idle). Each `botsdb` call is a python3 start
+  (~100 ms), so one pass reads everything with `relay-snapshot` and the timers poll only while something is waiting.
 - A headless `claude -p` for reflection loads every skill and MCP description (676,244 tokens measured); run it in an
   empty folder with `--setting-sources project --tools "" --disable-slash-commands --strict-mcp-config --system-prompt`
   (985 tokens).

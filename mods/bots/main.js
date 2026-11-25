@@ -20,6 +20,12 @@ const newId = () => `m${Date.now().toString(36)}${Math.random().toString(36).sli
 const BOTSDB = () => `${home()}/.herdr-bots/bin/botsdb`;
 const pad2 = (n) => String(n).padStart(2, "0");
 
+// A send without its done mark: that bot's reply has not been posted yet.
+function waitingForReply(events) {
+  const done = new Set(events.filter((e) => e.t === "done").map((e) => `${e.id}:${e.bot}`));
+  return events.some((e) => e.t === "send" && !done.has(`${e.id}:${e.bot}`));
+}
+
 export async function botsdb(...args) {
   const r = await exec(BOTSDB(), args);
   if (r.code !== 0) throw new Error(`botsdb ${args[0]}: ${r.stderr.trim()}`);
@@ -185,7 +191,11 @@ export default class Bots extends View {
     // and also catches the moment a bot leaves working after its reply is fully written.
     this.watched = new Set();
     this.watch(cx, `${home()}/.herdr-bots`);
-    cx.timer.every(1500, (cx) => cx.spawn(async (cx) => { await this.kick(cx); }));
+    // The tick only runs while something is waiting (a bot reply or a DM), plus a 30 s fallback: each pass starts a python3 process.
+    this.pending = true;
+    cx.timer.every(1500, (cx) => cx.spawn(async (cx) => {
+      if (this.pending || Date.now() - (this.relayedAt ?? 0) > 30_000) await this.kick(cx);
+    }));
     // The app does not report bot folders or plists, so reread them every minute. Status redraws whenever agents() changes.
     cx.timer.every(60_000, (cx) => cx.spawn(async (cx) => { await this.reload(cx); cx.notify(); }));
   }
@@ -218,6 +228,8 @@ export default class Bots extends View {
       for (;;) {
         const changed = await watchFolder(dir).catch(() => null);
         if (changed === null) { this.watched.delete(dir); return; }
+        // Every read of the database touches bots.db-shm; reacting to it would relay in a loop. Writes change bots.db-wal.
+        if (changed.length && changed.every((path) => path.endsWith("-shm"))) continue;
         await this.kick(cx);
       }
     });
@@ -230,6 +242,7 @@ export default class Bots extends View {
     try {
       do {
         this.relayAgain = false;
+        this.relayedAt = Date.now();
         if (await this.relay()) cx.notify();
       } while (this.relayAgain);
     } catch (e) {
@@ -241,13 +254,15 @@ export default class Bots extends View {
 
   // Per room: send what is unsent, post replies to what was sent, then move DMs. Returns true when the room list changed.
   async relay() {
-    const rooms = await botsdb("rooms");
-    for (const room of rooms) {
-      const { meta, events } = await botsdb("room-read", room.id);
-      const members = await botsdb("room-members", room.id);
-      await this.relayRoom(room.id, meta, events, members);
+    const snapshot = await botsdb("relay-snapshot");
+    const rooms = snapshot.rooms.map(({ meta, events, sessions, ...room }) => room);
+    let pending = snapshot.dms.queued.length + snapshot.dms.sent.length > 0;
+    for (const room of snapshot.rooms) {
+      if (waitingForReply(room.events)) pending = true;
+      await this.relayRoom(room.id, room.meta, room.events, room.sessions);
     }
-    await this.relayDms();
+    this.pending = pending;
+    await this.relayDms(snapshot.dms);
     if (!this.idleCheckedAt || Date.now() - this.idleCheckedAt > 60_000) {
       this.idleCheckedAt = Date.now();
       for (const idle of await botsdb("room-idle", String(ROOM_IDLE_MIN))) {
@@ -341,9 +356,9 @@ export default class Bots extends View {
   }
 
   // DMs between bots: deliver pending ones to the receiver's 1:1 session and mark the reply (botsdb creates a reply DM when one is expected).
-  async relayDms() {
+  async relayDms(dms) {
     const titles = shared("bots.titles") ?? {};
-    for (const dm of await botsdb("dm-list", "queued")) {
+    for (const dm of dms.queued) {
       const from = `@${titles[dm.from_bot] || dm.from_bot}`;
       const head = dm.answers
         ? `[DM reply · ${from} · ${dm.id}] A notification: do not DM back; continue your work here if needed.`
@@ -355,7 +370,7 @@ export default class Bots extends View {
       await botsdb("dm-mark", dm.id, "sent");
       await hc(["send", `bot-${dm.to_bot}`, body]).catch((e) => console.error("bots dm", e));
     }
-    for (const dm of await botsdb("dm-list", "sent")) {
+    for (const dm of dms.sent) {
       if (botStatus(dm.to_bot) === "working") continue;
       const reply = await replyIn(await newestTranscript(dm.to_bot), dm.id);
       if (!reply) continue;
