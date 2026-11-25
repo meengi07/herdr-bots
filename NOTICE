@@ -1,0 +1,23 @@
+herdr-bots
+Copyright 2026 herdr-bots contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Portions of this product are derived from Herdr (https://herdr.dev),
+Copyright the Herdr authors, licensed under the Apache License, Version 2.0.
+The following files were copied from Herdr's shipped mods (herdr-app 0.1.17)
+and modified:
+
+  mods/agents-bots/main.js   from mods/agents (v0.1.17)
+                             change: bot terminals (label herdr.bot) are drawn with the lamb icon
+  mods/tabs-bots/main.js     from mods/tabs (v0.1.17)
+                             change: bot terminal tabs are hidden from the tab bar
+  mods/desktop-toast/main.js from mods/toast (v0.1.16)
+                             change: also posts a macOS notification through alerter;
+                             bot notifications show the bot's last reply and open its chat window
+  layouts/bots.json          from layouts/main.json (v0.1.17)
+                             change: adds the Bots block and swaps in the mods above
+
+The lamb icon (mods/bots/lamb.svg, lamb.png) is original artwork and does not
+use the Herdr logo. "Herdr" is a name of its respective owners and is used here
+only to describe compatibility.
