@@ -1,0 +1,426 @@
+#!/usr/bin/python3 -I
+"""herdr 봇 로컬 DB(~/.herdr-bots/bots.db) 도우미. mod 는 이 명령만 거쳐 DB 를 읽고 쓴다.
+
+값은 항상 SQL 매개변수로 넘긴다(사용자 글이 SQL 로 해석되지 않게). 결과는 JSON 한 덩어리로 stdout 에 낸다.
+
+  botsdb bots                         봇 목록 [{id,title,color}]
+  botsdb bot-add <id>                 봇 행 추가(이미 있으면 그대로)
+  botsdb set-title <id> <title>       표시 이름(빈 문자열이면 id 로 되돌림)
+  botsdb bot-config <id>              {model, effort} (정하지 않았으면 기본값)
+  botsdb set-model <id> <model> <effort>   봇의 모델 · effort (다음에 띄울 때부터)
+  botsdb sessions <id>                그 봇의 Claude 세션 목록(최근 30개, 기록 파일로 색인 갱신)
+  botsdb rooms                        방 목록 [{id,title,members,last}]
+  botsdb room-create [title]          방 만들기(이름은 비워도 된다) → {"id"}
+  botsdb room-rename <room> <title>   방 이름 바꾸기
+  botsdb room-remove-member <room> <bot>   방에서 봇 빼기(그 봇의 방 세션 id 도 지운다)
+  botsdb room-set-host <room> <bot>   방장(첫 멤버) 바꾸기
+  botsdb room-archive <room>          채팅방 나가기: 목록에서 숨긴다(기록은 남는다)
+  botsdb bot-remove <bot>             봇 행 · 방 멤버 · 세션 색인 · DM 을 지운다(방 기록은 남긴다)
+  botsdb room-add <room> <bot>        방에 봇 넣기(처음 넣은 봇이 방장)
+  botsdb room-read <room> [after]     방 정보 + seq > after 인 사건들
+  botsdb room-append <room> <json>... 사건 넣기. send/done 은 (방, 종류, 말 id, 봇) 유니크라 두 번째는 무시 → {"inserted":[true|false,...]}
+  botsdb room-members <room>          멤버와 방 전용 Claude 세션 id [{bot, session}] (없으면 만든다)
+  botsdb chat-session <bot>           그 봇의 1:1 대화 세션 id(방 전용 세션을 뺀 가장 최근 기록) → {"id"} | {"id": null}
+  botsdb room-touch <room> <bot>      그 멤버의 방 세션 마지막 활동 시각을 지금으로
+  botsdb room-idle <분>               그 시간 넘게 쉰 방 세션 [{room, bot, session}]
+  botsdb room-mark-read <room> <seq>  방을 그 사건까지 읽음으로
+  botsdb dm-send <from> <to> <text>   봇끼리 직접 메시지. 홉 4까지, 보낸 쪽에게 돌아가는 답은 알림만 → {id} | {error}
+  botsdb dm-list <state>              queued | sent 인 DM 목록
+  botsdb dm-mark <id> <state> [reply] DM 상태 바꾸기(sent · done), 답 저장
+  botsdb migrate                      옛 파일(bot.json · rooms/*/room.json · room.jsonl)을 DB로 옮긴다(여러 번 돌려도 같다)
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+
+HOME = os.path.expanduser("~/.herdr-bots")
+# 봇은 대화형이라 응답 속도가 중요하다. 2026-11-25 실측(짧은 답, 캐시 데운 뒤 API 시간):
+# Opus 5.5·medium 3.5~7.8s, Opus·low 2.1~2.4s, Sonnet 5.5·low 0.8s, Haiku 5.5·low 0.85s.
+DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_EFFORT = "low"
+DB = os.path.join(HOME, "bots.db")
+DM_MAX_HOPS = 4          # Hermes bot_loop_guard.max_hops 와 같은 값
+DM_MAX_CHARS = 16_000
+OKABE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9"]
+
+SCHEMA = """
+create table if not exists bots (
+  id text primary key,
+  title text,
+  created_at text not null
+);
+create table if not exists sessions (
+  bot text not null,
+  session_id text not null,
+  title text,
+  last_at real not null,
+  primary key (bot, session_id)
+);
+create table if not exists rooms (
+  id text primary key,
+  title text not null,
+  created_at text not null
+);
+create table if not exists room_members (
+  room text not null,
+  bot text not null,
+  position integer not null,
+  primary key (room, bot)
+);
+create table if not exists room_events (
+  seq integer primary key autoincrement,
+  room text not null,
+  kind text not null,          -- msg | send | done
+  msg_id text not null,        -- msg: 그 말의 id, send/done: 대상 말의 id
+  sender text,                 -- msg: owner | 봇 id
+  bot text,                    -- send/done: 받는 봇
+  body text,                   -- msg: 본문
+  hop integer,
+  reply_to text,
+  reply text,
+  silent integer,
+  at text not null
+);
+-- 같은 말을 같은 봇에게 두 번 보내거나 두 번 받았다고 적지 않게 DB 가 막는다(msg 는 bot 이 null 이라 걸리지 않는다).
+create unique index if not exists room_events_once on room_events (room, kind, msg_id, bot) where kind in ('send', 'done');
+create index if not exists room_events_room on room_events (room, seq);
+"""
+
+
+def connect():
+    db = sqlite3.connect(DB, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("pragma journal_mode=wal")
+    db.executescript(SCHEMA)
+    # 나중에 생긴 칸: 예전 DB 에는 없으니 있을 때만 건너뛴다.
+    for table, column, kind in (("bots", "model", "text"), ("bots", "effort", "text"),
+                                ("room_events", "root", "text"), ("room_events", "needs", "integer"),
+                                ("room_members", "session_id", "text"), ("room_members", "last_active", "real"),
+                                ("rooms", "last_read_seq", "integer"), ("rooms", "archived", "integer")):
+        if column not in {r["name"] for r in db.execute(f"pragma table_info({table})")}:
+            db.execute(f"alter table {table} add column {column} {kind}")
+    db.executescript("""
+    create table if not exists dms (
+      id text primary key, chain text not null, hop integer not null,
+      from_bot text not null, to_bot text not null, body text not null,
+      expects_reply integer not null, answers text,
+      state text not null,            -- queued | sent | done
+      reply text, at text not null, done_at text
+    );""")
+    return db
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def out(value):
+    print(json.dumps(value, ensure_ascii=False))
+
+
+def bot_ids():
+    return sorted(d for d in os.listdir(HOME) if os.path.isfile(os.path.join(HOME, d, "CLAUDE.md")))
+
+
+def bots(db):
+    for bot in bot_ids():
+        db.execute("insert or ignore into bots (id, created_at) values (?, ?)", (bot, now()))
+    db.commit()
+    ids = bot_ids()
+    rows = {r["id"]: r for r in db.execute("select id, title, model, effort from bots")}
+    return [{"id": b, "title": (rows[b]["title"] or b) if b in rows else b, "color": OKABE[i % len(OKABE)],
+             "model": (rows[b]["model"] if b in rows else None) or DEFAULT_MODEL,
+             "effort": (rows[b]["effort"] if b in rows else None) or DEFAULT_EFFORT} for i, b in enumerate(ids)]
+
+
+def transcripts_dir(bot):
+    cwd = os.path.join(HOME, bot)
+    return os.path.expanduser("~/.claude/projects/" + "".join(c if c.isalnum() else "-" for c in cwd))
+
+
+def session_title(path, bot):
+    title, first = "", ""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"type":"custom-title"' in line:
+                try:
+                    found = json.loads(line).get("customTitle") or ""
+                except ValueError:
+                    continue
+                # 예전 herdr-bot 은 -n bot-<봇> 으로 띄워 세션 이름이 덮였다. 그 이름은 제목으로 쓰지 않는다.
+                if found and found != "bot-" + bot:
+                    title = found
+            elif not first and '"type":"user"' in line:
+                try:
+                    content = json.loads(line).get("message", {}).get("content")
+                except ValueError:
+                    continue
+                if isinstance(content, str) and not content.strip().startswith("<command"):
+                    first = content
+    if title:
+        return title
+    import re
+    text = re.sub(r"<[^>]+>", "", first).strip()
+    return text[:40] or "(제목 없음)"
+
+
+def room_session_ids(db, bot):
+    return {r[0] for r in db.execute("select session_id from room_members where bot = ? and session_id is not null", (bot,))}
+
+
+def chat_files(db, bot):
+    """1:1 대화 기록 파일(최근 것부터). 방 전용 세션도 같은 폴더에 쌓이므로 뺀다."""
+    folder = transcripts_dir(bot)
+    if not os.path.isdir(folder):
+        return []
+    rooms = room_session_ids(db, bot)
+    files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".jsonl") and f[:-6] not in rooms]
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def sessions(db, bot):
+    files = chat_files(db, bot)[:30]
+    known = {r["session_id"]: r for r in db.execute("select session_id, title, last_at from sessions where bot = ?", (bot,))}
+    result = []
+    for i, path in enumerate(files):
+        sid = os.path.basename(path)[:-6]
+        mtime = os.path.getmtime(path)
+        row = known.get(sid)
+        # 기록 파일이 바뀐 세션만 제목을 다시 읽는다(큰 파일을 매번 훑지 않게).
+        if row is None or row["last_at"] != mtime:
+            title = session_title(path, bot)
+            db.execute("insert into sessions (bot, session_id, title, last_at) values (?, ?, ?, ?) "
+                       "on conflict (bot, session_id) do update set title = excluded.title, last_at = excluded.last_at", (bot, sid, title, mtime))
+        else:
+            title = row["title"]
+        result.append({"id": sid, "title": title, "at": mtime, "current": i == 0})
+    db.commit()
+    return result
+
+
+def members(db, room):
+    return [r["bot"] for r in db.execute("select bot from room_members where room = ? order by position", (room,))]
+
+
+def rooms(db):
+    result = []
+    for r in db.execute("select id, title, coalesce(last_read_seq, 0) as read from rooms where archived is null order by created_at"):
+        last = db.execute("select max(at) from room_events where room = ? and kind = 'msg'", (r["id"],)).fetchone()[0]
+        unread, needs = db.execute("select count(*), coalesce(max(needs), 0) from room_events where room = ? and kind = 'msg' "
+                                   "and sender != 'owner' and seq > ?", (r["id"], r["read"])).fetchone()
+        result.append({"id": r["id"], "title": r["title"], "members": members(db, r["id"]), "last": last or "",
+                       "unread": unread, "needs": bool(needs)})
+    return result
+
+
+def room_members(db, room):
+    import uuid
+    result = []
+    for r in db.execute("select bot, session_id from room_members where room = ? order by position", (room,)).fetchall():
+        sid = r["session_id"]
+        if not sid:
+            sid = str(uuid.uuid4())
+            db.execute("update room_members set session_id = ? where room = ? and bot = ?", (sid, room, r["bot"]))
+        result.append({"bot": r["bot"], "session": sid})
+    db.commit()
+    return result
+
+
+def dm_send(db, sender, target, body):
+    known = set(bot_ids())
+    if target not in known:
+        return {"error": f"no such bot: {target}. bots: {', '.join(sorted(known))}"}
+    if target == sender:
+        return {"error": "cannot message yourself"}
+    if not body.strip() or len(body) > DM_MAX_CHARS:
+        return {"error": f"message must be 1-{DM_MAX_CHARS} characters"}
+    # 지금 이 봇이 답하고 있는 DM(받았는데 아직 안 끝난 것)이 있으면 그 체인을 잇는다.
+    answering = db.execute("select * from dms where to_bot = ? and state = 'sent' order by at desc limit 1", (sender,)).fetchone()
+    chain, hop = (answering["chain"], answering["hop"] + 1) if answering else ("c" + format(int(time.time() * 1000), "x"), 1)
+    if hop > DM_MAX_HOPS:
+        return {"error": f"this exchange already used {DM_MAX_HOPS} bot-to-bot messages; answer in your final message instead"}
+    if db.execute("select 1 from dms where chain = ? and to_bot = ? and body = ?", (chain, target, body)).fetchone():
+        return {"error": "same message already sent to that bot in this exchange"}
+    # 나를 깨운 봇에게 보내는 것은 답장이다: 알림만 가고 그 봇을 다시 깨워 답을 받지 않는다(Hermes 와 같은 규칙).
+    expects = 0 if answering and answering["from_bot"] == target else 1
+    dm = "d" + format(int(time.time() * 1000), "x") + os.urandom(2).hex()
+    db.execute("insert into dms (id, chain, hop, from_bot, to_bot, body, expects_reply, answers, state, at) values (?,?,?,?,?,?,?,?, 'queued', ?)",
+               (dm, chain, hop, sender, target, body, expects, answering["id"] if answering else None, now()))
+    db.commit()
+    return {"id": dm, "hop": hop, "expects_reply": bool(expects)}
+
+
+def event_json(r):
+    e = {"seq": r["seq"], "t": r["kind"], "id": r["msg_id"], "at": r["at"]}
+    for key, col in (("from", "sender"), ("bot", "bot"), ("text", "body"), ("hop", "hop"), ("replyTo", "reply_to"), ("reply", "reply"), ("root", "root")):
+        if r[col] is not None:
+            e[key] = r[col]
+    if r["silent"]:
+        e["silent"] = True
+    if r["needs"]:
+        e["needs"] = True
+    return e
+
+
+def append(db, room, event):
+    cur = db.execute(
+        "insert or ignore into room_events (room, kind, msg_id, sender, bot, body, hop, reply_to, reply, silent, at, root, needs) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (room, event["t"], event["id"], event.get("from"), event.get("bot"), event.get("text"), event.get("hop"),
+         event.get("replyTo"), event.get("reply"), 1 if event.get("silent") else None, event.get("at") or now(),
+         event.get("root"), 1 if event.get("needs") else None))
+    return cur.rowcount == 1
+
+
+def migrate(db):
+    for bot in bot_ids():
+        title = None
+        path = os.path.join(HOME, bot, "bot.json")
+        if os.path.isfile(path):
+            try:
+                title = json.load(open(path, encoding="utf-8")).get("title")
+            except ValueError:
+                pass
+        db.execute("insert into bots (id, title, created_at) values (?, ?, ?) on conflict (id) do update set title = coalesce(bots.title, excluded.title)", (bot, title, now()))
+    rooms_dir = os.path.join(HOME, "rooms")
+    for room in (sorted(os.listdir(rooms_dir)) if os.path.isdir(rooms_dir) else []):
+        meta_path = os.path.join(rooms_dir, room, "room.json")
+        if not os.path.isfile(meta_path):
+            continue
+        meta = json.load(open(meta_path, encoding="utf-8"))
+        db.execute("insert or ignore into rooms (id, title, created_at) values (?, ?, ?)", (room, meta.get("title") or room, now()))
+        for i, bot in enumerate(meta.get("members", [])):
+            db.execute("insert or ignore into room_members (room, bot, position) values (?, ?, ?)", (room, bot, i))
+        log = os.path.join(rooms_dir, room, "room.jsonl")
+        already = db.execute("select count(*) from room_events where room = ?", (room,)).fetchone()[0]
+        if os.path.isfile(log) and already == 0:
+            for line in open(log, encoding="utf-8"):
+                if line.strip():
+                    append(db, room, json.loads(line))
+    db.commit()
+    return {"bots": len(bot_ids()), "rooms": db.execute("select count(*) from rooms").fetchone()[0],
+            "events": db.execute("select count(*) from room_events").fetchone()[0]}
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    db = connect()
+    if cmd == "bots":
+        out(bots(db))
+    elif cmd == "bot-add":
+        db.execute("insert or ignore into bots (id, created_at) values (?, ?)", (args[0], now()))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "set-title":
+        db.execute("insert into bots (id, title, created_at) values (?, ?, ?) on conflict (id) do update set title = excluded.title",
+                   (args[0], args[1].strip() or None, now()))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "bot-config":
+        row = db.execute("select model, effort from bots where id = ?", (args[0],)).fetchone()
+        out({"model": (row and row["model"]) or DEFAULT_MODEL, "effort": (row and row["effort"]) or DEFAULT_EFFORT})
+    elif cmd == "set-model":
+        if args[2] not in ("low", "medium", "high", "xhigh", "max"):
+            print("effort must be low|medium|high|xhigh|max", file=sys.stderr)
+            return 2
+        db.execute("insert into bots (id, model, effort, created_at) values (?, ?, ?, ?) "
+                   "on conflict (id) do update set model = excluded.model, effort = excluded.effort", (args[0], args[1], args[2], now()))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "sessions":
+        out(sessions(db, args[0]))
+    elif cmd == "rooms":
+        out(rooms(db))
+    elif cmd == "room-create":
+        room = "r" + format(int(time.time() * 1000), "x")
+        db.execute("insert into rooms (id, title, created_at) values (?, ?, ?)", (room, (args[0] if args else "").strip(), now()))
+        db.commit()
+        out({"id": room})
+    elif cmd == "room-rename":
+        db.execute("update rooms set title = ? where id = ?", (args[1].strip(), args[0]))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "room-remove-member":
+        db.execute("delete from room_members where room = ? and bot = ?", (args[0], args[1]))
+        db.commit()
+        out({"members": members(db, args[0])})
+    elif cmd == "room-set-host":
+        order = [args[1]] + [b for b in members(db, args[0]) if b != args[1]]
+        for i, bot in enumerate(order):
+            db.execute("update room_members set position = ? where room = ? and bot = ?", (i, args[0], bot))
+        db.commit()
+        out({"members": members(db, args[0])})
+    elif cmd == "room-archive":
+        db.execute("update rooms set archived = 1 where id = ?", (args[0],))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "bot-remove":
+        bot = args[0]
+        for sql in ("delete from bots where id = ?", "delete from room_members where bot = ?", "delete from sessions where bot = ?",
+                    "delete from dms where from_bot = ? or to_bot = ?"):
+            db.execute(sql, (bot, bot) if sql.count("?") == 2 else (bot,))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "room-add":
+        position = db.execute("select coalesce(max(position) + 1, 0) from room_members where room = ?", (args[0],)).fetchone()[0]
+        db.execute("insert or ignore into room_members (room, bot, position) values (?, ?, ?)", (args[0], args[1], position))
+        db.commit()
+        out({"members": members(db, args[0])})
+    elif cmd == "room-read":
+        room = args[0]
+        after = int(args[1]) if len(args) > 1 else 0
+        meta = db.execute("select title, archived from rooms where id = ?", (room,)).fetchone()
+        events = [event_json(r) for r in db.execute("select * from room_events where room = ? and seq > ? order by seq", (room, after))]
+        out({"meta": {"title": meta["title"] if meta else "", "members": members(db, room), "archived": bool(meta and meta["archived"])}, "events": events})
+    elif cmd == "room-append":
+        room = args[0]
+        inserted = [append(db, room, json.loads(raw)) for raw in args[1:]]
+        db.commit()
+        out({"inserted": inserted})
+    elif cmd == "room-members":
+        out(room_members(db, args[0]))
+    elif cmd == "chat-session":
+        files = chat_files(db, args[0])
+        out({"id": os.path.basename(files[0])[:-6] if files else None, "file": files[0] if files else None})
+    elif cmd == "room-touch":
+        db.execute("update room_members set last_active = ? where room = ? and bot = ?", (time.time(), args[0], args[1]))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "room-idle":
+        cutoff = time.time() - float(args[0]) * 60
+        out([{"room": r["room"], "bot": r["bot"], "session": r["session_id"]} for r in db.execute(
+            "select room, bot, session_id from room_members where session_id is not null and last_active is not null and last_active < ?", (cutoff,))])
+    elif cmd == "room-mark-read":
+        db.execute("update rooms set last_read_seq = max(coalesce(last_read_seq, 0), ?) where id = ?", (int(args[1]), args[0]))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "dm-send":
+        out(dm_send(db, args[0], args[1].lstrip("@"), args[2]))
+    elif cmd == "dm-list":
+        out([dict(r) for r in db.execute("select * from dms where state = ? order by at", (args[0],))])
+    elif cmd == "dm-mark":
+        dm_id, state, reply = args[0], args[1], (args[2] if len(args) > 2 else None)
+        db.execute("update dms set state = ?, reply = coalesce(?, reply), done_at = case when ? = 'done' then ? else done_at end where id = ?",
+                   (state, reply, state, now(), dm_id))
+        row = db.execute("select * from dms where id = ?", (dm_id,)).fetchone()
+        # 답을 기다리던 DM 이 끝나면 그 답을 보낸 봇에게 돌려준다. 이것도 같은 체인의 한 홉이고, 알림만 간다.
+        if state == "done" and reply and row and row["expects_reply"] and row["hop"] < DM_MAX_HOPS:
+            back = "d" + format(int(time.time() * 1000), "x") + os.urandom(2).hex()
+            db.execute("insert into dms (id, chain, hop, from_bot, to_bot, body, expects_reply, answers, state, at) values (?,?,?,?,?,?,0,?, 'queued', ?)",
+                       (back, row["chain"], row["hop"] + 1, row["to_bot"], row["from_bot"], reply, dm_id, now()))
+        db.commit()
+        out({"ok": True})
+    elif cmd == "migrate":
+        out(migrate(db))
+    else:
+        print("unknown command: " + cmd, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
