@@ -1,27 +1,27 @@
-// 봇 채팅 화면: Claude Code 대화 기록(JSONL)을 채팅 앱처럼 보여 주고, 입력은 hc send 로 봇 터미널에 보낸다.
-// 권한 확인 · 선택지 질문은 기록에 남지 않으므로, 응답 필요 상태면 무엇을 묻는지와 함께 터미널로 넘기는 카드를 띄운다.
+// Bot chat window: shows the bot's Claude Code transcript (JSONL) like a chat app; input goes to the bot terminal with hc send.
+// Permission prompts and multiple-choice questions are not in the transcript, so when the bot needs you a card shows what it asks and hands off to the terminal.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea, ScrollHandle, TextView } from "gpui-base";
 import { props, agents, terminals, run, theme, exec, hc, home, checking, shared, closeOverlay, openOverlay, watchFolder } from "herdr";
 
-// 기록 파일($2 세션, 없으면 가장 최근)의 「수정 시각 생성 시각」을 첫 줄에, 그 뒤에 끝부분을 낸다.
-// 기록은 1 MiB 를 넘을 수 있어 readTextFile 대신 tail 을 쓴다.
+// Print "mtime ctime" of the transcript ($2's session, else the newest) on the first line, then its tail.
+// Transcripts can exceed 1 MiB, so use tail instead of readTextFile.
 const READ = 'if [ -n "$2" ]; then f="$1/$2.jsonl"; else f=$(ls -t "$1"/*.jsonl 2>/dev/null | head -1); fi; [ -f "$f" ] || exit 0; stat -f "%m %B" "$f"; tail -n 800 "$f"';
 const BIN = (h) => `${h}/.herdr-bots/bin/herdr-bot`;
 const BOTSDB = (h) => `${h}/.herdr-bots/bin/botsdb`;
-// 채팅에서 고를 수 있는 모델 · effort. id 는 claude --model 에 그대로 들어간다.
+// Models and efforts the chat offers; the id goes to claude --model as is.
 const MODELS = [["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"]];
 const EFFORTS = ["low", "medium", "high"];
 const LAMB = "mods/bots/lamb.png";
 const COLUMN = 760;
-// 화면 문구는 시스템 언어로(Bots mod 가 shared("bots.lang") 에 둔다): 한국어면 한국어, 그 밖은 영어.
+// UI text follows the system language (the Bots mod puts it in shared("bots.lang")): Korean when Korean comes first, English otherwise.
 const tr = (ko, en) => (shared("bots.lang") === "ko" ? ko : en);
 const WEEK_KO = ["일", "월", "화", "수", "목", "금", "토"];
 const WEEK_EN = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTH_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-// Claude Code 가 cwd 로 기록 폴더 이름을 짓는 규칙: 영숫자 말고는 모두 "-".
+// Claude Code names transcript folders after the cwd with every non-alphanumeric character turned into "-".
 const projectDir = (cwd) => `${home()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
 const pad = (n) => String(n).padStart(2, "0");
 const clock = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
@@ -37,7 +37,7 @@ const dayLabel = (date) => {
 };
 const elapsed = (ms) => `${Math.floor(ms / 60000)}:${pad(Math.floor((ms % 60000) / 1000))}`;
 
-// 도구 호출 한 건을 한 줄로: 명령 · 파일 · 검색어 · 주소 중 있는 것.
+// One tool call on one line: its command, file, query or URL, whichever it has.
 function toolDetail(input = {}) {
   const value = input.command ?? input.file_path ?? input.path ?? input.pattern ?? input.query ?? input.jql ?? input.url ?? input.description
     ?? Object.values(input).find((v) => typeof v === "string");
@@ -55,10 +55,10 @@ function parse(lines) {
     const at = d.timestamp ? new Date(d.timestamp) : null;
     const content = d.message?.content;
     if (d.type === "user" && typeof content === "string") {
-      // hc send 로 들어온 메시지는 <hc from="…">본문</hc> 로 감싸여 기록된다.
+      // Messages sent with hc send are recorded wrapped as <hc from="…">text</hc>.
       const wrapped = /^<hc from="([^"]*)">([\s\S]*)<\/hc>$/.exec(content.trim());
       const text = wrapped ? wrapped[2] : content;
-      // <command-name> · <local-command-stdout> 같은 내부 메시지는 대화가 아니다.
+      // Internal messages such as <command-name> or <local-command-stdout> are not conversation.
       if (text.trim().startsWith("<")) continue;
       const scheduled = /^\[(스케줄|schedule)\]/.test(text);
       out.push({ id: d.uuid, role: "user", text: scheduled ? text.replace(/^\[(스케줄|schedule)\]\s*/, "") : text, at, source: scheduled ? "schedule" : null });
@@ -84,16 +84,16 @@ export default class BotChat extends View {
     this.term = `bot-${this.bot}`;
     this.dir = projectDir(`${home()}/.herdr-bots/${this.bot}`);
     this.messages = [];
-    // 보냈지만 아직 대화 기록에 안 들어온 내 메시지. 기록에 나타나면 뺀다.
+    // My messages that were sent but are not in the transcript yet; dropped once they appear.
     this.pending = [];
-    this.view = null;          // 보고 있는 지난 세션 id. null 이면 지금 대화(가장 최근 기록)
-    this.clearedAt = 0;        // 「새 대화」를 누른 시각. 그 뒤에 생긴 기록이 나타날 때까지 빈 화면
+    this.view = null;          // the past session being viewed; null means the current conversation (newest transcript)
+    this.clearedAt = 0;        // when New chat was pressed; the view stays empty until a newer transcript appears
     this.sessions = [];
     this.showSessions = false;
     this.doing = "";
     this.showModel = false;
-    this.config = null;          // DB 에 저장된 모델 · effort
-    this.pendingRestart = false; // 작업 중이라 끝난 뒤 다시 띄워 적용할 것
+    this.config = null;          // model and effort stored in the database
+    this.pendingRestart = false; // restart after the current turn to apply a model change
     this.copied = null;
     this.scrollTo = null;
     this.tick = 0;
@@ -109,7 +109,7 @@ export default class BotChat extends View {
     this.input.on("submit", (e, cx) => { if (!e.shift) this.send(cx); });
     if (checking()) return;
     cx.spawn(async (cx) => { await this.load(); this.scrollTo = "end"; await this.facts(); cx.notify(); });
-    // 대화 기록 폴더가 바뀌는 즉시 읽는다. 폴더가 아직 없거나(첫 대화 전) 감시가 끊기면 아래 2초 확인이 대신한다.
+    // Read as soon as the transcript folder changes. Before the first chat (no folder yet) or if watching stops, the 2 s check below covers it.
     cx.spawn(async (cx) => {
       for (;;) {
         const changed = await watchFolder(this.dir).catch(() => null);
@@ -117,7 +117,7 @@ export default class BotChat extends View {
         await this.refresh(cx, false);
       }
     });
-    // 예비 확인 겸 작업 중 경과 시간 · 상태 문구 갱신.
+    // Fallback check, and refresh of the elapsed time and status line while working.
     cx.timer.every(2000, (cx) => cx.spawn(async (cx) => {
       await this.refresh(cx, true);
       if (this.pendingRestart && this.status() !== "working") await this.applyModel(cx);
@@ -135,7 +135,7 @@ export default class BotChat extends View {
         const status = this.status();
         const active = status === "working" || status === "blocked";
         if (active && withFacts) await this.facts();
-        // 메시지 객체는 바뀐 것만 새로 만들어 깜빡이지 않는다.
+        // Only rebuild message objects that changed, so nothing flickers.
         if (changed || (active && withFacts)) cx.notify();
       } while (this.reloadAgain);
     } finally {
@@ -144,7 +144,7 @@ export default class BotChat extends View {
   }
 
   async load() {
-    // 지금 대화(view 없음)는 방 전용 세션을 뺀 최신 1:1 세션이다.
+    // The current conversation (no view) is the newest 1:1 session, room sessions excluded.
     if (!this.view && (!this.chatSessionAt || Date.now() - this.chatSessionAt > 5000)) {
       const found = await exec(BOTSDB(home()), ["chat-session", this.bot]);
       this.chatSession = found.code === 0 ? JSON.parse(found.stdout).id : null;
@@ -153,27 +153,27 @@ export default class BotChat extends View {
     const r = await exec("/bin/sh", ["-c", READ, "_", this.dir, this.view ?? this.chatSession ?? ""]);
     const [stamp, ...lines] = r.stdout.split("\n");
     const born = Number(stamp?.split(" ")[1] ?? 0) * 1000;
-    // 새 대화를 누른 뒤에는 그보다 늦게 생긴 기록이 보일 때까지 비워 둔다.
+    // After New chat, stay empty until a newer transcript shows up.
     const waitingNew = this.clearedAt && born < this.clearedAt - 2000;
     const key = waitingNew ? "new" : `${this.view}:${stamp}`;
     if (!stamp || key === this.mtime) return false;
     this.mtime = key;
     if (!waitingNew) this.clearedAt = 0;
     const parsed = waitingNew ? [] : parse(lines);
-    // 바뀌지 않은 메시지는 같은 객체를 그대로 써서 마크다운을 다시 그리지 않는다.
+    // Reuse unchanged message objects so their Markdown is not redrawn.
     const before = new Map(this.messages.map((m) => [m.id, m]));
     const same = (a, b) => a && a.text === b.text && (a.tools?.length ?? 0) === (b.tools?.length ?? 0);
     const added = parsed.filter((m) => !before.has(m.id));
     this.messages = parsed.map((m) => (same(before.get(m.id), m) ? before.get(m.id) : m));
     this.pending = this.pending.filter((p) => !parsed.some((m) => m.role === "user" && m.text.trim() === p.text && m.at && m.at.getTime() >= p.at.getTime() - 10_000));
-    // 새 봇 답이 오면 그 답의 시작으로, 내 메시지만 새로 들어왔으면 맨 끝으로.
+    // A new bot reply scrolls to its start; only my new message scrolls to the end.
     const reply = added.find((m) => m.role === "assistant");
     if (reply) this.scrollTo = reply.id;
     else if (added.length) this.scrollTo = "end";
     return true;
   }
 
-  // 응답 필요일 때 무엇을 묻는지(봇이 보고한 msg)와 모델을 터미널 정보에서 읽는다.
+  // From the terminal info: what the bot asks when it needs you (the msg it reports) and its model.
   async facts() {
     const r = await hc(["get", this.term, "--json"]);
     if (r.code !== 0) return;
@@ -190,7 +190,7 @@ export default class BotChat extends View {
     if (r.code === 0) this.config = JSON.parse(r.stdout);
   }
 
-  // 모델 · effort 를 고르면 DB 에 저장하고 봇을 다시 띄운다(마지막 대화 이어서). 작업 중이면 끝난 뒤에.
+  // Choosing a model or effort saves it to the database and restarts the bot (continuing the last conversation); while working, after the turn.
   async chooseModel(model, effort, cx) {
     await exec(BOTSDB(home()), ["set-model", this.bot, model, effort]);
     this.config = { model, effort };
@@ -227,7 +227,7 @@ export default class BotChat extends View {
       .child(div().text_size(11.5).text_color(this.pendingRestart || this.restarting ? t.working : t.dim).child(note));
   }
 
-  // Bots 섹션에서 바꾼 표시 이름(bot.json). 없으면 폴더 이름.
+  // The display name set in the Bots section; the folder name when there is none.
   title() {
     return shared("bots.titles")?.[this.bot] || this.bot;
   }
@@ -241,7 +241,7 @@ export default class BotChat extends View {
     return terminal ? agents().find((a) => a.address === terminal.address)?.status ?? "idle" : null;
   }
 
-  // 보낸 메시지는 바로 말풍선으로 띄우고 그 자리로 스크롤한다. hc send 는 입력이 조용해질 때까지(약 3초) 기다리므로 뒤에서 보낸다.
+  // Show a sent message as a bubble at once and scroll to it. hc send waits until input is quiet (about 3 s), so it runs in the background.
   send(cx) {
     const text = this.input.value().trim();
     if (!text) return;
@@ -266,12 +266,12 @@ export default class BotChat extends View {
     });
   }
 
-  // 최소화: 같은 key 로 창을 헤더 높이로 다시 연다(위치는 key 가 기억한다). 복원은 원래 크기로.
+  // Minimize: reopen the window with the same key at header height (the key keeps its position); restore to full size.
   resize(minimized) {
     openOverlay({ kind: "window", mod: "bot-chat", key: `chat-${this.bot}`, keep: true, width: minimized ? 320 : 520, height: minimized ? 52 : 680, props: { bot: this.bot, minimized } });
   }
 
-  // 대화 목록은 로컬 DB 색인(botsdb sessions)에서 읽는다. 바뀐 세션만 botsdb 가 기록 파일을 다시 훑는다.
+  // The session list comes from the local database index (botsdb sessions); botsdb rescans only transcripts that changed.
   async loadSessions() {
     const r = await exec(`${home()}/.herdr-bots/bin/botsdb`, ["sessions", this.bot]);
     const list = r.code === 0 ? JSON.parse(r.stdout) : [];
@@ -288,7 +288,7 @@ export default class BotChat extends View {
     cx.notify();
   }
 
-  // 새 대화: 봇에게 /clear 를 보내 세션을 새로 시작한다.
+  // New chat: send /clear to the bot to start a fresh session.
   newChat(cx) {
     this.view = null;
     this.showSessions = false;
@@ -302,7 +302,7 @@ export default class BotChat extends View {
     cx.notify();
   }
 
-  // 보고 있는 지난 대화를 이어 간다: 봇을 그 세션으로 다시 띄운다.
+  // Continue the past conversation being viewed: restart the bot on that session.
   resumeViewed(cx) {
     const id = this.view;
     this.resuming = true;
@@ -322,7 +322,7 @@ export default class BotChat extends View {
     hc(["interrupt", this.term]).catch(() => {});
   }
 
-  // 메시지 사이에 날짜 구분선을 끼운 표시 순서.
+  // Display order with date dividers between messages.
   rows() {
     const rows = [];
     let day = "";
@@ -427,13 +427,13 @@ export default class BotChat extends View {
     const terminal = this.terminal();
     const working = status === "working";
     const chip = (text) => div().px(10).py(2).rounded(999).border_1().border_color(t.border).text_size(12).text_color(t.muted).child(text);
-    // 떠 있는 창에서는 누르고 끄는 곳이 창을 옮긴다. 헤더만 손잡이로 두고 나머지는 누름을 여기서 멈춘다.
+    // In a floating window a press anywhere moves the window. Keep the header as the handle and stop presses here.
     const keep = (_e, cx) => cx.stop_propagation();
     const minimized = Boolean(props()?.minimized);
     const windowButton = (id, label, onClick) => div().id(id).size(26).flex_none().rounded(6).flex().items_center().justify_center()
       .cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", keep).on_click(onClick).child(label);
-    // 스크롤 영역의 직접 자식이 곧 한 줄이어야 scroll_to_item 이 그 줄로 간다. 줄마다 가운데 정렬 틀을 씌운다.
+    // scroll_to_item only reaches direct children of the scroll element, so each row gets its own centered wrapper.
     const line = (child, top = 11, bottom = 11) => h_flex().w_full().flex_none().justify_center().pt(top).pb(bottom)
       .child(v_flex().w_full().max_w(COLUMN).px(20).child(child));
     const ordered = this.rows();

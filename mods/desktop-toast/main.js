@@ -1,4 +1,4 @@
-// Modified by herdr-bots from Herdr's shipped "toast" mod (v0.1.16, Apache-2.0): 알림을 macOS 알림 센터(alerter)로도 보내고, 봇 알림에는 받은 메시지를 띄운다. See NOTICE.
+// Modified by herdr-bots from Herdr's shipped "toast" mod (v0.1.16, Apache-2.0): also posts to macOS Notification Center (alerter) and shows a bot's message in its notification. See NOTICE.
 // How notifications look. Anything can post one with notify({ title, body,
 // level, icon, action }); replace this mod to restyle them all. Click to
 // run its action (e.g. go to the agent) and dismiss it.
@@ -14,13 +14,13 @@ const TEXT = {
         botNeeds: "Needs you", botNew: "New message", roomNeeds: "Needs you in a room", roomDone: "Replied in a room", roomOpen: "Open the room to see it" },
 };
 
-// alerter 는 알림이 닫힐 때까지 돌아오지 않는다. 토스트가 닫혀도 살아 있도록 떼어 내고, 본문을 누르면 Herdr 를 앞으로 가져와 $4 의 명령들(한 줄에 「이름<TAB>JSON 인자」)을 차례로 실행한다.
+// alerter blocks until the notification closes. Detach it so it outlives the toast; a click brings Herdr forward and runs the commands in $4 (one "name<TAB>JSON args" per line).
 const PUSH = '"$0" --sender dev.herdr.app --title "$1" --subtitle "$2" --message "$3" --timeout 60 --json ${6:+--content-image "$6"}'
   + ' | grep -q contentsClicked && open -b dev.herdr.app && printf "%s\\n" "$4" | while IFS="$(printf "\\t")" read -r name args; do [ -n "$name" ] && "$5" do "$name" "$args"; done';
 
-// 봇의 마지막 답: 가장 최근 대화 기록에서 assistant 의 마지막 text 를 마크다운 기호를 걷어 한 줄로.
+// A bot's last reply: the last assistant text of its newest transcript, Markdown stripped, on one line.
 async function lastBotReply(bot) {
-  // 1:1 대화 기록(방 전용 세션 제외)의 끝부분.
+  // The tail of the 1:1 transcript (room sessions excluded).
   const found = await exec(`${home()}/.herdr-bots/bin/botsdb`, ["chat-session", bot]);
   const file = found.code === 0 ? JSON.parse(found.stdout).file : null;
   if (!file) return "";
@@ -36,14 +36,14 @@ async function lastBotReply(bot) {
   return "";
 }
 
-// 봇 알림은 그 봇의 떠 있는 채팅 창으로 간다. 창은 Bots mod 가 연다(bots.chat-<봇> 명령).
+// A bot notification opens that bot's floating chat window, which the Bots mod opens (command bots.chat-<bot>).
 function botActions(bot) {
   return [[`bots.chat-${bot}`, {}]];
 }
 
 async function push(p) {
   const config = JSON.parse((await readTextFile(`${appHome()}/mods/desktop-toast/config.json`)) ?? "{}");
-  // config.json 의 lang: "auto"(기본) 면 시스템 언어(Bots mod 가 읽어 둔 shared("bots.lang")), "ko" · "en" 이면 그 언어로 고정.
+  // config.json lang: "auto" (default) follows the system language (shared("bots.lang") from the Bots mod); "ko" or "en" fixes it.
   const lang = !config.lang || config.lang === "auto" ? shared("bots.lang") ?? "en" : config.lang;
   const text = TEXT[lang] ?? TEXT.en;
   const address = p.action?.name === "agent.focus" ? p.action.args?.terminal : null;
@@ -56,7 +56,7 @@ async function push(p) {
   if (agent) {
     const facts = await hc(["get", address, "--json"]);
     const status = facts.code === 0 ? JSON.parse(facts.stdout).status ?? {} : {};
-    // done 은 사용자가 보는 순간 idle 로 바뀌므로 토스트 level 로도 가른다.
+    // done turns into idle as soon as the user looks, so also tell it apart by the toast level.
     const blocked = agent.status === "blocked" || p.level === "error";
     const labels = terminals().find((x) => x.address === address)?.labels ?? {};
     const bot = labels["herdr.bot"];
@@ -66,13 +66,13 @@ async function push(p) {
     subtitle = [agent.title, `${agent.space_name} / ${agent.tab_name || agent.tab_index}`].filter(Boolean).join(" · ");
     message = status.msg || (blocked ? text.blockedMsg : text.doneMsg);
     if (bot) {
-      // 봇은 채팅 앱처럼: 제목은 봇 이름, 본문은 받은 메시지(응답 필요면 무엇을 묻는지).
+      // Bots read like a chat app: the title is the bot's name, the body its message (or what it asks when it needs you).
       title = shared("bots.titles")?.[bot] || bot;
       subtitle = blocked ? text.botNeeds : text.botNew;
       message = blocked ? status.msg || text.blockedMsg : (await lastBotReply(bot)) || text.doneMsg;
       actions = botActions(bot);
       if (room) {
-        // 방 전용 세션의 알림: 방에 이미 올라간 답이 있으니 방 창으로 보낸다.
+        // A room session's notification: the reply is already in the room, so open the room window.
         subtitle = blocked ? text.roomNeeds : text.roomDone;
         message = blocked ? status.msg || text.blockedMsg : text.roomOpen;
         actions = [[`bots.room-${room}`, {}]];
@@ -80,7 +80,7 @@ async function push(p) {
     }
   }
   const commands = actions.map(([name, args]) => `${name}\t${JSON.stringify(args)}`).join("\n");
-  // alerter 가 없으면 데스크톱 알림만 건너뛴다(앱 안 토스트는 그대로 뜬다).
+  // Without alerter only the desktop notification is skipped (the in-app toast still shows).
   const script = `export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; command -v "$0" >/dev/null 2>&1 || exit 0; (${PUSH}) >/dev/null 2>&1 &`;
   await exec("/bin/sh", ["-c", script, "alerter", title, subtitle, message, commands, "herdr-app", image]);
 }

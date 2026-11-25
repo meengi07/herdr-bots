@@ -1,19 +1,19 @@
 #!/usr/bin/python3 -I
-"""herdr 봇의 페르소나(SOUL.md) · 기억(MEMORY.md) 관리. 같은 DB(~/.herdr-bots/bots.db)를 쓴다.
+"""Persona (SOUL.md) and memory (MEMORY.md) upkeep for herdr bots. Uses the same database (~/.herdr-bots/bots.db).
 
-  botsmem hook-prompt              Claude Code UserPromptSubmit 훅: SOUL · MEMORY 가 이 세션이 마지막으로 본 것과 다르면
-                                   바뀐 부분을 그 턴의 맥락으로 붙인다(stdin: 훅 JSON)
-  botsmem hook-stop                Claude Code Stop 훅: 턴을 세고, 5턴마다 봇이 쉬는 틈에 회고(reflect)를 뒤에서 시작한다
-  botsmem reflect-input <bot>      회고 프롬프트(마지막 회고 이후 대화 + 지금 SOUL · MEMORY). 새 대화가 없으면 빈 출력
-  botsmem reflect-apply <bot>      회고 결과(claude -p JSON, stdin)를 검사해 SOUL · MEMORY 에 적용하고 이력을 남긴다
-  botsmem history <bot> [n]        최근 변경 이력
-  botsmem undo <bot> [id]          변경 하나(기본: 마지막)를 되돌린다
+  botsmem hook-prompt              Claude Code UserPromptSubmit hook: when SOUL or MEMORY differs from what this session last saw,
+                                   adds the change to the turn's context (stdin: hook JSON)
+  botsmem hook-stop                Claude Code Stop hook: counts turns and every 5 turns starts a reflection in the background
+  botsmem reflect-input <bot>      the reflection prompt (conversation since the last reflection + current SOUL and MEMORY); empty when nothing new
+  botsmem reflect-apply <bot>      checks the reflection result (claude -p JSON on stdin), applies it to SOUL and MEMORY and records history
+  botsmem history <bot> [n]        recent changes
+  botsmem undo <bot> [id]          undo one change (default: the last)
 
-검사(Orca 의 기억 관리 규칙을 따름):
-- 오너가 정한 줄(Rule · Prefers · Decided)은 고치거나 지우지 못한다. 새로 넣으려면 오너 말 인용(quote)이 대화에 있어야 한다.
-- 한 번에 지울 수 있는 MEMORY 줄은 25%까지(최소 1줄). 지운 줄은 memory/archive.md 로 옮긴다.
-- 최근 14일 안에 지운 줄과 거의 같은 줄은 다시 넣지 않는다.
-- 비밀처럼 보이는 줄은 넣지 않는다. SOUL 의 제목 줄과 「## Never」 절은 건드리지 않는다.
+Checks (after Orca's memory rules):
+- Owner lines (Rule, Prefers, Decided) cannot be edited or removed. Adding one needs a quote from a message the owner typed.
+- At most 25% of MEMORY lines (at least 1) can be removed per run. Removed lines move to memory/archive.md.
+- A line nearly identical to one removed in the last 14 days is not added again.
+- Lines that look like secrets are not added. SOUL's title line and its "## Never" section are never touched.
 """
 import datetime
 import difflib
@@ -28,9 +28,9 @@ import time
 
 HOME = os.path.expanduser("~/.herdr-bots")
 DB = os.path.join(HOME, "bots.db")
-REFLECT_EVERY = 5            # 이 턴 수마다 회고
-REFLECT_STALE_S = 15 * 60    # 회고 표시가 이보다 오래되면 끊긴 것으로 본다
-EXCERPT_CHARS = 30_000       # 회고에 넣는 대화 최대 글자(최근 것부터)
+REFLECT_EVERY = 5            # reflect every this many turns
+REFLECT_STALE_S = 15 * 60    # a reflection mark older than this is treated as crashed
+EXCERPT_CHARS = 30_000       # most characters of conversation given to a reflection (newest first)
 MAX_LOSS = 0.25
 OWNER_KINDS = ("Rule", "Prefers", "Decided")
 KINDS = OWNER_KINDS + ("Fact", "Lesson")
@@ -90,7 +90,7 @@ def write_atomic(path, text):
 
 
 def bot_of(cwd):
-    # 봇 세션의 cwd 는 ~/.herdr-bots/<봇> 이다. 그 밖의 세션은 훅이 아무것도 하지 않는다.
+    # A bot session's cwd is ~/.herdr-bots/<bot>; the hooks do nothing for any other session.
     cwd = os.path.realpath(cwd or "")
     root = os.path.realpath(HOME)
     if os.path.dirname(cwd) != root:
@@ -99,7 +99,7 @@ def bot_of(cwd):
     return bot if os.path.isfile(os.path.join(cwd, "CLAUDE.md")) else None
 
 
-# ── 지문 비교 주입 ─────────────────────────────────────────────
+# ── Fingerprint diff injection ─────────────────────────────────────────────
 
 def hook_prompt(db):
     event = json.load(sys.stdin)
@@ -114,7 +114,7 @@ def hook_prompt(db):
                "on conflict (bot, session_id) do update set soul = excluded.soul, memory = excluded.memory, at = excluded.at",
                (bot, session, soul, memory, now_iso()))
     db.commit()
-    # 처음 보는 세션은 시작할 때 CLAUDE.md 로 지금 파일을 읽었다. 그 뒤 바뀐 것만 알린다.
+    # A session seen for the first time read the current files through CLAUDE.md at start; report only later changes.
     if seen is None:
         return
     parts = []
@@ -131,7 +131,7 @@ def hook_prompt(db):
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}, ensure_ascii=False))
 
 
-# ── 회고 시작 ─────────────────────────────────────────────────
+# ── Start a reflection ─────────────────────────────────────────────────
 
 def hook_stop(db):
     event = json.load(sys.stdin)
@@ -146,20 +146,20 @@ def hook_stop(db):
         return
     db.execute("update bot_turns set turns = 0, reflecting_since = ? where bot = ?", (time.time(), bot))
     db.commit()
-    # 훅은 바로 끝나야 한다: 회고는 떼어 낸 프로세스로 돌린다.
+    # Hooks must return at once: the reflection runs in a detached process.
     herdr_bot = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bot")
     log = open(os.path.join(bot_home(bot), "reflect.log"), "a")
     subprocess.Popen([herdr_bot, "reflect", bot], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
-# ── 회고 입력 ─────────────────────────────────────────────────
+# ── Reflection input ─────────────────────────────────────────────────
 
 def transcripts_dir(bot):
     return os.path.expanduser("~/.claude/projects/" + "".join(c if c.isalnum() else "-" for c in bot_home(bot)))
 
 
 def conversation_since(bot, since):
-    """마지막 회고 이후의 대화(사람 · 봇 글만). 1:1 과 방 세션을 모두 본다."""
+    """Conversation since the last reflection (human and bot text only), from the 1:1 and room sessions."""
     folder = transcripts_dir(bot)
     entries = []
     if not os.path.isdir(folder):
@@ -184,9 +184,9 @@ def conversation_since(bot, since):
                     raw = content.strip()
                     wrapped = raw.startswith("<hc from=")
                     text = re.sub(r"^<hc from=\"[^\"]*\">|</hc>$", "", raw)
-                    # 오너 말은 오너가 직접 친 글뿐이다: 다른 터미널이 보낸 글(<hc from>), 방 전달, DM, 일정 실행은 아니다.
-                    # 회고가 Rule · Prefers · Decided 를 넣을 때 인용을 이 글에서만 찾는다(남의 글로 오너 규칙을 심지 못하게).
-                    relayed = wrapped or text.startswith(("[방:", "[DM", "[schedule]", "[스케줄]"))
+                    # Owner words are only what the owner typed: not text sent from another terminal (<hc from>), room relays, DMs or schedule runs.
+                    # Reflection looks for Rule/Prefers/Decided quotes only in these (so someone else's text cannot plant an owner rule).
+                    relayed = wrapped or text.startswith(("[room:", "[방:", "[DM", "[schedule]", "[스케줄]"))
                     entries.append((at, "relay" if relayed else "owner", text))
                 elif d.get("type") == "assistant" and isinstance(content, list):
                     text = "\n".join(p.get("text", "") for p in content if p.get("type") == "text").strip()
@@ -254,7 +254,7 @@ def reflect_input(db, bot):
           .replace("{conversation}", conversation))
 
 
-# ── 회고 적용 ─────────────────────────────────────────────────
+# ── Apply a reflection ─────────────────────────────────────────────────
 
 def similar(a, b):
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() >= 0.8
@@ -450,6 +450,6 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except Exception as e:  # 훅이 실패해도 봇 턴을 막지 않는다
+    except Exception as e:  # a failing hook must not block the bot's turn
         print(f"botsmem: {e}", file=sys.stderr)
         sys.exit(0 if sys.argv[1:2] and sys.argv[1].startswith("hook-") else 1)

@@ -1,30 +1,30 @@
 #!/bin/sh
-# herdr-bot new <name>            봇 홈(SOUL.md · MEMORY.md · CLAUDE.md)을 만든다
-# herdr-bot start <name>        봇 세션을 띄우고 herdr 탭으로 보여 준다(이미 떠 있으면 탭만)
-# herdr-bot remove <name>         봇 제거: 세션 · 일정을 끄고 폴더를 ~/.herdr-bots/.trash 로 옮긴다
-# herdr-bot dm <to> <text>        (봇 안에서) 다른 봇에게 직접 메시지. 홉 4까지, 나를 깨운 봇에게는 알림만
-# herdr-bot start-room <name> <room> <session>   방 전용 세션을 띄운다(전달기가 부른다)
-# herdr-bot hooks <name>          봇 폴더에 훅(SOUL · MEMORY 변경 주입, 회고 시작)을 깐다
-# herdr-bot reflect <name>        회고를 지금 한 번 돌린다(보통은 5턴마다 자동)
-# herdr-bot restart <name>        다시 띄운다(마지막 대화 이어서, 모델 · effort 다시 읽음)
-# herdr-bot resume <name> <id>   지난 대화(세션)로 바꿔 다시 띄운다
-# herdr-bot send <name> <text>    봇에게 메시지를 보낸다(꺼져 있으면 먼저 띄운다)
-# herdr-bot schedule <name> <HH:MM> <weekdays|daily|0-6,...> <prompt>   launchd 로 정해진 시각에 send 한다
-# herdr-bot unschedule <name>      일정을 지운다
+# herdr-bot new <name>            make a bot home (SOUL.md, MEMORY.md, CLAUDE.md)
+# herdr-bot start <name>          start the bot session in a hidden Herdr tab (no-op if it runs)
+# herdr-bot remove <name>         remove a bot: stop its sessions and schedule, move its folder to ~/.herdr-bots/.trash
+# herdr-bot dm <to> <text>        (inside a bot) message another bot directly. At most 4 hops; the bot that woke you only gets a notification
+# herdr-bot start-room <name> <room> <session>   start a room-only session (called by the relay)
+# herdr-bot hooks <name>          install the hooks in the bot folder (SOUL/MEMORY change notes, reflection)
+# herdr-bot reflect <name>        run a reflection now (normally every 5 turns)
+# herdr-bot restart <name>        restart (continue the last conversation, reread model and effort)
+# herdr-bot resume <name> <id>    restart on a past conversation (session)
+# herdr-bot send <name> <text>    send the bot a message (starts it first if it is off)
+# herdr-bot schedule <name> <HH:MM> <weekdays|daily|0-6,...> <prompt>   send at a set time through launchd
+# herdr-bot unschedule <name>     remove the schedule
 #
-# 모델 · effort: botsdb set-model <봇> <모델> <effort> (기본 claude-sonnet-5-5 · low). 환경 변수 HERDR_BOT_MODEL · HERDR_BOT_EFFORT · HERDR_BOT_PERMISSION 이 있으면 그쪽이 이긴다.
+# Model and effort: botsdb set-model <bot> <model> <effort> (default claude-sonnet-5-5, low). HERDR_BOT_MODEL, HERDR_BOT_EFFORT and HERDR_BOT_PERMISSION win when set.
 set -eu
-# launchd 는 로그인 셸 PATH 를 주지 않는다.
+# launchd does not pass the login shell's PATH.
 export PATH="$HOME/.local/bin:$HOME/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
 cmd=${1:?usage: herdr-bot new|start|resume|send|schedule|unschedule <name> ...}
 name=${2:?bot name}
-# 봇 이름은 폴더 · 터미널 이름 · 라벨이 된다: 경로 밖으로 나가지 않게 모든 명령에서 검사한다(방 메시지 링크로도 들어온다).
+# The bot name becomes a folder, terminal name and label: check it for every command so it cannot leave the bots folder (it also arrives from room message links).
 printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9-]{0,23}$' || { echo "herdr-bot: bad bot name: $name" >&2; exit 2; }
 home="$HOME/.herdr-bots/$name"
 term="bot-$name"
 
-# 봇 폴더의 Claude Code 프로젝트 훅: 턴마다 SOUL · MEMORY 변경을 붙이고(hook-prompt), 턴 수를 세어 회고를 띄운다(hook-stop).
+# Claude Code project hooks in the bot folder: add SOUL/MEMORY changes to each turn (hook-prompt), count turns and start reflections (hook-stop).
 write_hooks() {
   mkdir -p "$1/.claude"
   cat > "$1/.claude/settings.json" <<'JSON'
@@ -38,7 +38,7 @@ JSON
 }
 
 if [ "$cmd" = new ]; then
-  # hc 터미널 이름 규칙(1-32자 a-z 0-9 - _)에 "bot-" 접두를 붙여도 맞도록 24자로 자른다.
+  # Cut to 24 characters so "bot-" + name still fits hc's terminal name rule (1-32 of a-z 0-9 - _).
   printf %s "$name" | grep -Eq '^[a-z0-9][a-z0-9-]{0,23}$' || { echo "bot name must be a-z 0-9 - (max 24): $name" >&2; exit 2; }
   [ -e "$home" ] && { echo "already exists: $home" >&2; exit 1; }
   mkdir -p "$home"
@@ -54,18 +54,18 @@ fi
 
 live() { hc get "${1:-$term}" --json 2>/dev/null | grep -q '"state":"live"'; }
 
-# 대화 기록 폴더: Claude Code 는 cwd 의 영숫자 아닌 글자를 모두 "-" 로 바꿔 이름을 짓는다.
+# Transcript folder: Claude Code names it after the cwd with every non-alphanumeric character turned into "-".
 transcripts="$HOME/.claude/projects/$(printf %s "$home" | sed 's/[^a-zA-Z0-9]/-/g')"
 
-# 모델 · effort 는 봇마다 DB 에 있다(botsdb set-model). 환경 변수가 있으면 그쪽이 이긴다.
+# Model and effort are per bot in the database (botsdb set-model); environment variables win when set.
 load_model() {
   config=$("$(dirname "$0")/botsdb" bot-config "$name")
   model=${HERDR_BOT_MODEL:-$(printf %s "$config" | sed -n 's/.*"model": "\([^"]*\)".*/\1/p')}
   effort=${HERDR_BOT_EFFORT:-$(printf %s "$config" | sed -n 's/.*"effort": "\([^"]*\)".*/\1/p')}
 }
 
-# Herdr 가 에이전트로 보도록 탭에 붙이되(terminal.keep), 탭 막대에서는 치워 둔다(tab.settle). 봇과는 채팅 창으로 이야기한다.
-# 봇이 응답을 기다리면 Herdr 가 그 탭을 다시 꺼내 준다. terminal.park 는 봇을 끝내 버려서 쓰지 않는다.
+# Keep the tab so Herdr treats it as an agent (terminal.keep), but settle it out of the tab bar (tab.settle). You talk to bots in the chat window.
+# When the bot waits for input Herdr brings the tab back. terminal.park ends the bot, so it is not used.
 keep_hidden() {
   address=$(hc get "$1" --json | sed -n 's/.*"address":"\([^"]*\)".*/\1/p')
   herdr-app do terminal.keep "{\"terminal\":\"$address\"}" >/dev/null 2>&1 || true
@@ -73,19 +73,19 @@ keep_hidden() {
   [ -n "$tab" ] && herdr-app do tab.settle "{\"id\":\"$tab\"}" >/dev/null 2>&1 || true
 }
 
-# start [세션 id]: 세션을 주면 그 대화를, 아니면 마지막 대화를 이어서 띄운다(대화가 없으면 새로).
-# 봇 프로세스는 HERDR_BOT(자기 id)을 안다: herdr-bot dm 이 보낸 이를 여기서 읽는다.
+# start [session id]: continue that conversation when given, else the last one (a new one when there is none).
+# The bot process knows its own id as HERDR_BOT: herdr-bot dm reads the sender from it.
 start() {
   if ! live; then
-    # --continue 는 방 전용 세션을 집을 수 있다(같은 폴더에 쌓인다). 1:1 세션을 DB 에서 골라 --resume 한다.
+    # --continue can pick a room session (they share the folder): look up the 1:1 session in the database and --resume it.
     last=$("$(dirname "$0")/botsdb" chat-session "$name" | sed -n 's/.*"id": "\([^"]*\)".*/\1/p')
     if [ -n "${1:-}" ]; then resume="--resume $1"
     elif [ -n "$last" ]; then resume="--resume $last"
     else resume=""
     fi
     load_model
-    # --no-parent: 띄운 터미널이 닫혀도 봇은 남는다. --keep: 프로그램이 죽으면 셸로 바꿔 둔다(재실행은 하지 않는다).
-    # $resume 은 일부러 따옴표 없이 둔다(옵션과 값 두 단어로 나뉘어야 한다).
+    # --no-parent: the bot outlives the terminal that started it. --keep: when the program exits, keep a shell (no restart).
+    # $resume is unquoted on purpose (it must split into an option and its value).
     hc rm "$term" >/dev/null 2>&1 || true
     hc run --bg --keep --no-parent --name "$term" --label "herdr.bot=$name" --cwd "$home" \
       env HERDR_BOT="$name" claude --model "$model" --effort "$effort" --permission-mode "${HERDR_BOT_PERMISSION:-auto}" $resume >/dev/null
@@ -94,7 +94,7 @@ start() {
   keep_hidden "$term"
 }
 
-# 방 전용 세션: 방마다 · 멤버마다 Claude 세션 하나(1:1 대화와 섞이지 않게). 터미널 이름은 32자 제한이라 해시로 짓는다.
+# Room-only sessions: one Claude session per room and member (kept apart from the 1:1 chat). Terminal names are limited to 32 characters, hence the hash.
 room_term() { printf 'rb-%s' "$(printf %s "$1:$name" | shasum | cut -c1-12)"; }
 
 start_room() {
@@ -116,7 +116,7 @@ start_room() {
 case $cmd in
   start) start ;;
   remove)
-    # 봇 제거: 이 봇의 세션(1:1 · 방)을 모두 끄고 일정을 지운 뒤, 폴더는 지우지 않고 .trash 로 옮긴다(되돌릴 수 있게).
+    # Remove a bot: stop all its sessions (1:1 and rooms), remove its schedule, and move the folder to .trash instead of deleting it (recoverable).
     for address in $(hc ls --json | /usr/bin/python3 -I -c 'import json,sys
 for t in json.load(sys.stdin)["terminals"]:
     if (t.get("labels") or {}).get("herdr.bot") == sys.argv[1]: print(t["address"])' "$name"); do
@@ -131,14 +131,14 @@ for t in json.load(sys.stdin)["terminals"]:
     "$(dirname "$0")/botsdb" bot-remove "$name"
     ;;
   dm)
-    # 봇이 다른 봇에게: herdr-bot dm <받는 봇> "<메시지>". 보낸 이는 봇 프로세스의 HERDR_BOT 이다.
+    # Bot to bot: herdr-bot dm <bot> "<message>". The sender is the bot process's HERDR_BOT.
     from=${HERDR_BOT:?HERDR_BOT is not set: only a running bot can send a DM}
     result=$("$(dirname "$0")/botsdb" dm-send "$from" "$name" "${3:?message}")
     herdr-app do bots.relay >/dev/null 2>&1 || true
     echo "$result"
     ;;
   start-room)
-    # herdr-bot start-room <봇> <방> <세션 id>: 그 방 전용 세션을 띄우고 터미널 이름을 출력한다.
+    # herdr-bot start-room <bot> <room> <session id>: start that room session and print its terminal name.
     start_room "${3:?room}" "${4:?session id}"
     ;;
   stop-room)
@@ -146,13 +146,13 @@ for t in json.load(sys.stdin)["terminals"]:
     live "$rterm" && hc kill "$rterm" >/dev/null 2>&1 || true
     ;;
   hooks)
-    # 이미 있는 봇에 훅을 깐다(다음에 띄울 때부터 적용).
+    # Install hooks in an existing bot (from its next start).
     write_hooks "$home"
     echo "$home/.claude/settings.json"
     ;;
   reflect)
-    # 회고: 마지막 회고 이후 대화로 SOUL · MEMORY 변경을 제안받아 botsmem 이 검사 후 적용한다.
-    # 봇 폴더 밖 빈 폴더에서, 사용자 설정 · 스킬 · MCP · 도구 없이 돌린다(훅이 다시 불리지 않고 프롬프트가 1천 토큰 남짓).
+    # Reflection: proposes SOUL/MEMORY changes from the conversation since the last one; botsmem checks and applies them.
+    # Runs in an empty folder outside the bot's, without user settings, skills, MCP or tools (hooks do not fire again, the prompt is about 1k tokens).
     prompt=$("$(dirname "$0")/botsmem" reflect-input "$name")
     [ -n "$prompt" ] || exit 0
     scratch="$HOME/.herdr-bots/.reflect"
@@ -163,12 +163,12 @@ for t in json.load(sys.stdin)["terminals"]:
     printf '%s' "$out" | "$(dirname "$0")/botsmem" reflect-apply "$name"
     ;;
   restart)
-    # 모델을 바꾼 뒤 등: 지금 세션을 끝내고 마지막 대화를 이어서 다시 띄운다.
+    # E.g. after a model change: end the current session and restart on the last conversation.
     live && hc kill "$term" >/dev/null 2>&1 || true
     start
     ;;
   resume)
-    # 지난 대화로 바꾼다: 지금 세션을 끝내고 그 세션으로 다시 띄운다.
+    # Switch to a past conversation: end the current session and restart on that one.
     session=${3:?session id}
     printf %s "$session" | grep -Eq '^[0-9a-f-]{36}$' || { echo "bad session id: $session" >&2; exit 2; }
     live && hc kill "$term" >/dev/null 2>&1 || true
@@ -177,11 +177,11 @@ for t in json.load(sys.stdin)["terminals"]:
   send)
     text=${3:?text}
     start
-    # 봇이 승인 대기(blocked) 중이면 hc 가 거부한다. 이번 회차는 건너뛰고 로그만 남긴다.
+    # hc refuses while the bot waits for approval (blocked): skip this run and only log it.
     hc send "$term" "$text" >/dev/null
     ;;
   schedule)
-    # 같은 봇의 일정은 하나다. 다시 부르면 바꾼다. plist 는 Python plistlib 로 써서 프롬프트의 특수 문자가 깨지지 않게 한다.
+    # One schedule per bot; calling again replaces it. The plist is written with Python plistlib so special characters in the prompt survive.
     at=${3:?HH:MM}; days=${4:?weekdays|daily|0-6,...}; prompt=${5:?prompt}
     label="dev.herdr-bots.$name"
     plist="$HOME/Library/LaunchAgents/$label.plist"

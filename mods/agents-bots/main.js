@@ -1,4 +1,4 @@
-// Modified by herdr-bots from Herdr's shipped "agents" mod (v0.1.17, Apache-2.0): 봇 터미널(라벨 herdr.bot)을 아기 양 아이콘으로 그린다. See NOTICE.
+// Modified by herdr-bots from Herdr's shipped "agents" mod (v0.1.17, Apache-2.0): draws bot terminals (label herdr.bot) with the lamb icon. See NOTICE.
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
 
 import { View, div, image, svg } from "gpui-kit";
@@ -77,7 +77,7 @@ function duration(ms) {
 }
 
 // The agent's icon from the app's program table: a one-color glyph or a picture.
-// herdr-bot 이 띄운 터미널(라벨 herdr.bot)은 프로그램 아이콘 대신 어린 양을 보여 준다.
+// Terminals started by herdr-bot (label herdr.bot) show the lamb instead of the program icon.
 const LAMB = { icon: "mods/bots/lamb.png", tint: false };
 let bots = new Set();
 const programOf = (a) => (bots.has(a.address) ? LAMB : a.program);

@@ -1,33 +1,33 @@
 #!/usr/bin/python3 -I
-"""herdr 봇 로컬 DB(~/.herdr-bots/bots.db) 도우미. mod 는 이 명령만 거쳐 DB 를 읽고 쓴다.
+"""Local database helper for herdr bots (~/.herdr-bots/bots.db). Mods read and write the database only through this command.
 
-값은 항상 SQL 매개변수로 넘긴다(사용자 글이 SQL 로 해석되지 않게). 결과는 JSON 한 덩어리로 stdout 에 낸다.
+Values are always bound as SQL parameters (user text is never read as SQL). Output is one JSON value on stdout.
 
-  botsdb bots                         봇 목록 [{id,title,color}]
-  botsdb bot-add <id>                 봇 행 추가(이미 있으면 그대로)
-  botsdb set-title <id> <title>       표시 이름(빈 문자열이면 id 로 되돌림)
-  botsdb bot-config <id>              {model, effort} (정하지 않았으면 기본값)
-  botsdb set-model <id> <model> <effort>   봇의 모델 · effort (다음에 띄울 때부터)
-  botsdb sessions <id>                그 봇의 Claude 세션 목록(최근 30개, 기록 파일로 색인 갱신)
-  botsdb rooms                        방 목록 [{id,title,members,last}]
-  botsdb room-create [title]          방 만들기(이름은 비워도 된다) → {"id"}
-  botsdb room-rename <room> <title>   방 이름 바꾸기
-  botsdb room-remove-member <room> <bot>   방에서 봇 빼기(그 봇의 방 세션 id 도 지운다)
-  botsdb room-set-host <room> <bot>   방장(첫 멤버) 바꾸기
-  botsdb room-archive <room>          채팅방 나가기: 목록에서 숨긴다(기록은 남는다)
-  botsdb bot-remove <bot>             봇 행 · 방 멤버 · 세션 색인 · DM 을 지운다(방 기록은 남긴다)
-  botsdb room-add <room> <bot>        방에 봇 넣기(처음 넣은 봇이 방장)
-  botsdb room-read <room> [after]     방 정보 + seq > after 인 사건들
-  botsdb room-append <room> <json>... 사건 넣기. send/done 은 (방, 종류, 말 id, 봇) 유니크라 두 번째는 무시 → {"inserted":[true|false,...]}
-  botsdb room-members <room>          멤버와 방 전용 Claude 세션 id [{bot, session}] (없으면 만든다)
-  botsdb chat-session <bot>           그 봇의 1:1 대화 세션 id(방 전용 세션을 뺀 가장 최근 기록) → {"id"} | {"id": null}
-  botsdb room-touch <room> <bot>      그 멤버의 방 세션 마지막 활동 시각을 지금으로
-  botsdb room-idle <분>               그 시간 넘게 쉰 방 세션 [{room, bot, session}]
-  botsdb room-mark-read <room> <seq>  방을 그 사건까지 읽음으로
-  botsdb dm-send <from> <to> <text>   봇끼리 직접 메시지. 홉 4까지, 보낸 쪽에게 돌아가는 답은 알림만 → {id} | {error}
-  botsdb dm-list <state>              queued | sent 인 DM 목록
-  botsdb dm-mark <id> <state> [reply] DM 상태 바꾸기(sent · done), 답 저장
-  botsdb migrate                      옛 파일(bot.json · rooms/*/room.json · room.jsonl)을 DB로 옮긴다(여러 번 돌려도 같다)
+  botsdb bots                         bots [{id,title,color}]
+  botsdb bot-add <id>                 add a bot row (no-op if it exists)
+  botsdb set-title <id> <title>       display name (an empty string goes back to the id)
+  botsdb bot-config <id>              {model, effort} (defaults when unset)
+  botsdb set-model <id> <model> <effort>   the bot's model and effort (from its next start)
+  botsdb sessions <id>                the bot's Claude sessions (latest 30; refreshes the index from transcripts)
+  botsdb rooms                        rooms [{id,title,members,last}]
+  botsdb room-create [title]          create a room (the title may be empty) -> {"id"}
+  botsdb room-rename <room> <title>   rename a room
+  botsdb room-remove-member <room> <bot>   remove a bot from a room (and its room session id)
+  botsdb room-set-host <room> <bot>   change the host (first member)
+  botsdb room-archive <room>          leave a room: hide it from the list (history stays)
+  botsdb bot-remove <bot>             delete the bot row, its memberships, session index and DMs (room history stays)
+  botsdb room-add <room> <bot>        add a bot to a room (the first one is the host)
+  botsdb room-read <room> [after]     room info + events with seq > after
+  botsdb room-append <room> <json>... add events. send/done are unique per (room, kind, message id, bot); a repeat is ignored -> {"inserted":[true|false,...]}
+  botsdb room-members <room>          members and their room-only Claude session ids [{bot, session}] (created when missing)
+  botsdb chat-session <bot>           the bot's 1:1 session id (newest transcript, room sessions excluded) -> {"id"} | {"id": null}
+  botsdb room-touch <room> <bot>      set that member's last room-session activity to now
+  botsdb room-idle <minutes>          room sessions idle longer than that [{room, bot, session}]
+  botsdb room-mark-read <room> <seq>  mark the room read up to that event
+  botsdb dm-send <from> <to> <text>   a direct message between bots. At most 4 hops; a reply to the sender is notify-only -> {id} | {error}
+  botsdb dm-list <state>              DMs that are queued | sent
+  botsdb dm-mark <id> <state> [reply] set a DM's state (sent, done) and store the reply
+  botsdb migrate                      move old files (bot.json, rooms/*/room.json, room.jsonl) into the database (safe to rerun)
 """
 import json
 import os
@@ -36,12 +36,12 @@ import sys
 import time
 
 HOME = os.path.expanduser("~/.herdr-bots")
-# 봇은 대화형이라 응답 속도가 중요하다. 2026-11-25 실측(짧은 답, 캐시 데운 뒤 API 시간):
+# Bots are conversational, so latency matters. Measured 2026-11-25 (short answer, warm cache, API time):
 # Opus 5.5·medium 3.5~7.8s, Opus·low 2.1~2.4s, Sonnet 5.5·low 0.8s, Haiku 5.5·low 0.85s.
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_EFFORT = "low"
 DB = os.path.join(HOME, "bots.db")
-DM_MAX_HOPS = 4          # Hermes bot_loop_guard.max_hops 와 같은 값
+DM_MAX_HOPS = 4          # same as Hermes bot_loop_guard.max_hops
 DM_MAX_CHARS = 16_000
 OKABE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9"]
 
@@ -73,17 +73,17 @@ create table if not exists room_events (
   seq integer primary key autoincrement,
   room text not null,
   kind text not null,          -- msg | send | done
-  msg_id text not null,        -- msg: 그 말의 id, send/done: 대상 말의 id
-  sender text,                 -- msg: owner | 봇 id
-  bot text,                    -- send/done: 받는 봇
-  body text,                   -- msg: 본문
+  msg_id text not null,        -- msg: this message's id; send/done: the target message's id
+  sender text,                 -- msg: owner | bot id
+  bot text,                    -- send/done: the receiving bot
+  body text,                   -- msg: the text
   hop integer,
   reply_to text,
   reply text,
   silent integer,
   at text not null
 );
--- 같은 말을 같은 봇에게 두 번 보내거나 두 번 받았다고 적지 않게 DB 가 막는다(msg 는 bot 이 null 이라 걸리지 않는다).
+-- The database refuses sending the same message to the same bot twice or recording its reply twice (msg rows have a null bot and are not affected).
 create unique index if not exists room_events_once on room_events (room, kind, msg_id, bot) where kind in ('send', 'done');
 create index if not exists room_events_room on room_events (room, seq);
 """
@@ -94,7 +94,7 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute("pragma journal_mode=wal")
     db.executescript(SCHEMA)
-    # 나중에 생긴 칸: 예전 DB 에는 없으니 있을 때만 건너뛴다.
+    # Columns added later: skip when they already exist.
     for table, column, kind in (("bots", "model", "text"), ("bots", "effort", "text"),
                                 ("room_events", "root", "text"), ("room_events", "needs", "integer"),
                                 ("room_members", "session_id", "text"), ("room_members", "last_active", "real"),
@@ -149,7 +149,7 @@ def session_title(path, bot):
                     found = json.loads(line).get("customTitle") or ""
                 except ValueError:
                     continue
-                # 예전 herdr-bot 은 -n bot-<봇> 으로 띄워 세션 이름이 덮였다. 그 이름은 제목으로 쓰지 않는다.
+                # Older herdr-bot started bots with -n bot-<bot>, which overwrote the session name; do not use that name as a title.
                 if found and found != "bot-" + bot:
                     title = found
             elif not first and '"type":"user"' in line:
@@ -163,7 +163,7 @@ def session_title(path, bot):
         return title
     import re
     text = re.sub(r"<[^>]+>", "", first).strip()
-    return text[:40] or "(제목 없음)"
+    return text[:40] or "(untitled)"
 
 
 def room_session_ids(db, bot):
@@ -171,7 +171,7 @@ def room_session_ids(db, bot):
 
 
 def chat_files(db, bot):
-    """1:1 대화 기록 파일(최근 것부터). 방 전용 세션도 같은 폴더에 쌓이므로 뺀다."""
+    """1:1 transcript files, newest first. Room sessions share the folder, so they are excluded."""
     folder = transcripts_dir(bot)
     if not os.path.isdir(folder):
         return []
@@ -188,7 +188,7 @@ def sessions(db, bot):
         sid = os.path.basename(path)[:-6]
         mtime = os.path.getmtime(path)
         row = known.get(sid)
-        # 기록 파일이 바뀐 세션만 제목을 다시 읽는다(큰 파일을 매번 훑지 않게).
+        # Only reread titles of sessions whose transcript changed (do not scan large files every time).
         if row is None or row["last_at"] != mtime:
             title = session_title(path, bot)
             db.execute("insert into sessions (bot, session_id, title, last_at) values (?, ?, ?, ?) "
@@ -236,14 +236,14 @@ def dm_send(db, sender, target, body):
         return {"error": "cannot message yourself"}
     if not body.strip() or len(body) > DM_MAX_CHARS:
         return {"error": f"message must be 1-{DM_MAX_CHARS} characters"}
-    # 지금 이 봇이 답하고 있는 DM(받았는데 아직 안 끝난 것)이 있으면 그 체인을 잇는다.
+    # If this bot is answering a DM right now (received, not finished), continue that chain.
     answering = db.execute("select * from dms where to_bot = ? and state = 'sent' order by at desc limit 1", (sender,)).fetchone()
     chain, hop = (answering["chain"], answering["hop"] + 1) if answering else ("c" + format(int(time.time() * 1000), "x"), 1)
     if hop > DM_MAX_HOPS:
         return {"error": f"this exchange already used {DM_MAX_HOPS} bot-to-bot messages; answer in your final message instead"}
     if db.execute("select 1 from dms where chain = ? and to_bot = ? and body = ?", (chain, target, body)).fetchone():
         return {"error": "same message already sent to that bot in this exchange"}
-    # 나를 깨운 봇에게 보내는 것은 답장이다: 알림만 가고 그 봇을 다시 깨워 답을 받지 않는다(Hermes 와 같은 규칙).
+    # Sending to the bot that woke you is a reply: it is notify-only and does not wake that bot for an answer (same rule as Hermes).
     expects = 0 if answering and answering["from_bot"] == target else 1
     dm = "d" + format(int(time.time() * 1000), "x") + os.urandom(2).hex()
     db.execute("insert into dms (id, chain, hop, from_bot, to_bot, body, expects_reply, answers, state, at) values (?,?,?,?,?,?,?,?, 'queued', ?)",
@@ -407,7 +407,7 @@ def main(argv):
         db.execute("update dms set state = ?, reply = coalesce(?, reply), done_at = case when ? = 'done' then ? else done_at end where id = ?",
                    (state, reply, state, now(), dm_id))
         row = db.execute("select * from dms where id = ?", (dm_id,)).fetchone()
-        # 답을 기다리던 DM 이 끝나면 그 답을 보낸 봇에게 돌려준다. 이것도 같은 체인의 한 홉이고, 알림만 간다.
+        # When a DM that expected a reply is done, return the reply to the sender. That is one more hop of the same chain, notify-only.
         if state == "done" and reply and row and row["expects_reply"] and row["hop"] < DM_MAX_HOPS:
             back = "d" + format(int(time.time() * 1000), "x") + os.urandom(2).hex()
             db.execute("insert into dms (id, chain, hop, from_bot, to_bot, body, expects_reply, answers, state, at) values (?,?,?,?,?,?,0,?, 'queued', ?)",

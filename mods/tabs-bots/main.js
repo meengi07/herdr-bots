@@ -1,4 +1,4 @@
-// Modified by herdr-bots from Herdr's shipped "tabs" mod (v0.1.17, Apache-2.0): 봇 터미널 탭을 탭 막대에서 숨긴다. See NOTICE.
+// Modified by herdr-bots from Herdr's shipped "tabs" mod (v0.1.17, Apache-2.0): hides bot terminal tabs from the tab bar. See NOTICE.
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
 import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings, terminals } from "herdr";
@@ -91,7 +91,7 @@ export default class Tabs extends View {
   render() {
     const t = theme();
     const space = spaces().find(p => p.active);
-    // herdr-bot 의 봇 터미널 탭은 숨긴다. 봇과는 Bots 섹션의 채팅 창으로 이야기한다.
+    // Hide herdr-bot terminal tabs; you talk to bots through the chat windows in the Bots section.
     const botTabs = new Set(terminals().filter((x) => x.labels?.["herdr.bot"]).map((x) => x.labels?.["herdr.tab"]));
     const shown = (space?.tabs ?? []).filter((tab) => !botTabs.has(tab.id));
     const active = shown.findIndex(tab => tab.active);

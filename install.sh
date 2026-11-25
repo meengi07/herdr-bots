@@ -48,7 +48,7 @@ cp "$repo/runtime/bin/herdr-bot" "$repo/runtime/bin/botsdb" "$repo/runtime/bin/b
 chmod +x "$bots_home/bin/herdr-bot" "$bots_home/bin/botsdb" "$bots_home/bin/botsmem"
 [ -e "$bots_home/RULES.md" ] || cp "$repo/runtime/RULES.md" "$bots_home/RULES.md"
 "$bots_home/bin/botsdb" migrate >/dev/null
-# 이미 있는 봇에도 훅(SOUL · MEMORY 변경 주입, 회고)을 깐다. 다음에 띄울 때부터 적용된다.
+# Install the hooks (SOUL/MEMORY change notes, reflection) for existing bots too; they apply from the next start.
 for bot in "$bots_home"/*/; do
   [ -f "$bot/CLAUDE.md" ] && "$bots_home/bin/herdr-bot" hooks "$(basename "$bot")" >/dev/null
 done

@@ -1,5 +1,5 @@
-// 묶음 대화(방) 창: 방 기록(로컬 DB, botsdb)을 봇별 색 말풍선으로 보여 주고, 내 말을 방에 올린다.
-// 봇에게 보내고 답을 받아 올리는 일은 Bots mod 의 전달기가 한다. 이 창은 읽고, 내 말만 적는다.
+// Room window: shows the room's history (local database, botsdb) as colored bubbles per bot and posts your messages to the room.
+// Sending to bots and posting their replies is the Bots mod relay's job. This window reads, and writes only your messages.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea, ScrollHandle, TextView, InputState, Input } from "gpui-base";
@@ -7,7 +7,7 @@ import { props, agents, terminals, run, theme, exec, home, checking, shared, clo
 
 const LAMB = "mods/bots/lamb.png";
 const COLUMN = 720;
-const ROUNDS = 3; // 전달기(bots mod)와 같은 값: 사람 글 하나에 봇 차례 라운드
+const ROUNDS = 3; // same as the relay (bots mod): bot rounds per human message
 async function botsdb(...args) {
   const r = await exec(`${home()}/.herdr-bots/bin/botsdb`, args);
   if (r.code !== 0) throw new Error(`botsdb ${args[0]}: ${r.stderr.trim()}`);
@@ -17,11 +17,11 @@ const pad = (n) => String(n).padStart(2, "0");
 const MODELS = [["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"]];
 const EFFORTS = ["low", "medium", "high"];
 const clock = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-// 화면 문구는 시스템 언어로(Bots mod 가 shared("bots.lang") 에 둔다): 한국어면 한국어, 그 밖은 영어.
+// UI text follows the system language (the Bots mod puts it in shared("bots.lang")): Korean when Korean comes first, English otherwise.
 const tr = (ko, en) => (shared("bots.lang") === "ko" ? ko : en);
 const newId = () => `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-// 이 창이 보는 것은 그 봇의 이 방 전용 세션이다(1:1 세션이 아니다).
+// This window looks at the bot's session for this room (not its 1:1 session).
 let ROOM = "";
 const botTerminal = (bot) => terminals().find((x) => x.labels?.["herdr.bot"] === bot && x.labels?.["herdr.room"] === ROOM && x.state === "live") ?? null;
 const botStatus = (bot) => {
@@ -33,19 +33,19 @@ export default class BotRoom extends View {
   init(_props, cx) {
     this.room = props()?.room ?? "";
     ROOM = this.room;
-    this.seq = 0;           // 마지막으로 읽은 사건 번호. 그 뒤의 새 사건만 읽는다.
+    this.seq = 0;           // last event number read; only later events are read
     this.meta = { title: this.room, members: [] };
     this.events = [];
-    this.optimistic = [];   // 화면에는 띄웠지만 아직 room.jsonl 에 안 적힌 내 말
+    this.optimistic = [];   // my messages already shown but not yet stored
     this.written = [];
-    // 사이드바 + 로 막 만든 방이면 봇 추가 줄을 펼친 채로 연다.
+    // A room just created with the sidebar + opens with the bot picker expanded.
     this.adding = Boolean(props()?.adding);
     this.showMembers = false;
     this.editingTitle = false;
     this.titleInput = InputState.new({ value: "", placeholder: tr("방 이름", "Room name") });
     this.titleInput.on("submit", (_e, cx) => cx.spawn(async (cx) => { await this.saveTitle(cx); }));
-    this.configs = {};             // 봇별 { model, effort } (DB)
-    this.pendingRestart = new Set(); // 작업 중이라 끝난 뒤 다시 띄워 적용할 봇
+    this.configs = {};             // { model, effort } per bot (database)
+    this.pendingRestart = new Set(); // bots to restart after their turn to apply a model change
     this.restarting = new Set();
     this.scroll = ScrollHandle.new();
     this.scrollTo = null;
@@ -54,7 +54,7 @@ export default class BotRoom extends View {
     this.input.on("submit", (e, cx) => { if (!e.shift) this.send(cx); });
     if (checking()) return;
     cx.spawn(async (cx) => { await this.load(); this.scrollTo = "end"; cx.notify(); });
-    // 방 기록은 ~/.herdr-bots/bots.db 에 있다. 그 폴더가 바뀌는 즉시 새 사건을 읽는다.
+    // Room history is in ~/.herdr-bots/bots.db; read new events as soon as that folder changes.
     cx.spawn(async (cx) => {
       for (;;) {
         const changed = await watchFolder(`${home()}/.herdr-bots`).catch(() => null);
@@ -63,7 +63,7 @@ export default class BotRoom extends View {
       }
     });
     cx.spawn(async (cx) => { await this.loadConfigs(); cx.notify(); });
-    // 예비 확인 겸, 멤버가 일하는 동안 상태 줄 갱신. 모델 적용을 기다리던 봇이 쉬면 그때 다시 띄운다.
+    // Fallback check, and status refresh while members work. A bot waiting for a model change is restarted once it is idle.
     cx.timer.every(2000, (cx) => cx.spawn(async (cx) => {
       for (const bot of [...this.pendingRestart]) if (botStatus(bot) !== "working") await this.applyModel(bot, cx);
       const changed = this.loadingNow ? false : await this.load();
@@ -74,12 +74,12 @@ export default class BotRoom extends View {
   async load() {
     const read = await botsdb("room-read", this.room, String(this.seq));
     const meta = read.meta;
-    // 보낸 직후의 읽기와 폴더 변경 알림의 읽기가 겹치면 같은 사건을 두 번 받는다. 이미 읽은 번호 이하는 버린다.
+    // The read right after sending and the read on a folder change can overlap and return the same event; drop numbers already seen.
     const events = read.events.filter((e) => e.seq > this.seq);
     const metaChanged = JSON.stringify(meta) !== JSON.stringify(this.meta);
     if (!events.length && !metaChanged) return false;
     this.meta = meta;
-    // 사이드바에서 「채팅방 나가기」를 했으면 이 창도 닫는다.
+    // Close this window too when the room was left from the sidebar.
     if (meta.archived && props()?.overlay) { closeOverlay(props().overlay); return false; }
     if (events.length) {
       this.seq = events.at(-1).seq;
@@ -89,7 +89,7 @@ export default class BotRoom extends View {
     const ids = new Set(this.written.map((e) => e.id));
     this.optimistic = this.optimistic.filter((e) => !ids.has(e.id));
     this.events = [...this.written, ...this.optimistic];
-    // 창이 펼쳐져 있으면 여기까지 읽은 것이다.
+    // An expanded window means everything so far has been read.
     if (this.seq && !props()?.minimized) botsdb("room-mark-read", this.room, String(this.seq)).catch(() => {});
     return true;
   }
@@ -113,7 +113,7 @@ export default class BotRoom extends View {
     cx.notify();
   }
 
-  // 멤버 빼기: 그 봇의 이 방 세션을 끄고 멤버에서 지운다(방 기록은 남는다). 다시 넣으면 새 방 세션으로 시작한다.
+  // Remove a member: stop its session for this room and drop it from the members (history stays). Added again, it starts a new room session.
   async removeMember(bot, cx) {
     await exec(`${home()}/.herdr-bots/bin/herdr-bot`, ["stop-room", bot, this.room]).catch(() => {});
     await botsdb("room-remove-member", this.room, bot);
@@ -137,7 +137,7 @@ export default class BotRoom extends View {
     return shared("bots.colors")?.[bot] ?? t.accent;
   }
 
-  // 입력 내용을 글자로: 토큰 자리는 토큰의 text(@이름)로 채운다.
+  // Input as text: token spans become the token's text (@name).
   plainText() {
     const content = this.input.content();
     const spans = [...content.tokens].sort((a, b) => a.range.start - b.range.start);
@@ -150,7 +150,7 @@ export default class BotRoom extends View {
     return out + content.text.slice(at);
   }
 
-  // 보낸 말은 바로 그리고(파일 쓰기를 기다리지 않는다), 쓰기가 끝나면 전달기를 바로 깨운다.
+  // Draw a sent message at once (without waiting for the write), and wake the relay as soon as the write ends.
   send(cx) {
     const text = this.plainText().trim();
     if (!text) return;
@@ -175,7 +175,7 @@ export default class BotRoom extends View {
     this.configs = Object.fromEntries(bots.map((b) => [b.id, { model: b.model, effort: b.effort }]));
   }
 
-  // 멤버의 모델 · effort 를 바꾸면 DB 에 저장하고 그 봇을 다시 띄운다(대화는 이어진다). 작업 중이면 끝난 뒤에.
+  // Changing a member's model or effort saves it and restarts that bot (the conversation continues); while working, after the turn.
   async chooseModel(bot, model, effort, cx) {
     await botsdb("set-model", bot, model, effort);
     this.configs[bot] = { model, effort };
@@ -189,7 +189,7 @@ export default class BotRoom extends View {
     this.restarting.add(bot);
     cx.notify();
     await exec(`${home()}/.herdr-bots/bin/herdr-bot`, ["restart", bot], { timeout: 120_000 }).catch(() => {});
-    // 이 방 전용 세션은 끈다. 다음 전달 때 새 모델로 다시 뜬다(대화는 이어진다).
+    // Stop this room's session; the next relay starts it again with the new model (the conversation continues).
     await exec(`${home()}/.herdr-bots/bin/herdr-bot`, ["stop-room", bot, this.room]).catch(() => {});
     this.restarting.delete(bot);
     cx.notify();
@@ -235,7 +235,7 @@ export default class BotRoom extends View {
     cx.notify();
   }
 
-  // 멘션 버튼: 커서를 맨 끝으로 옮긴 뒤 봇 색 칩(토큰)으로 넣고 한 칸 띄운다. 보낼 때는 토큰의 text(@이름)가 본문에 들어간다.
+  // Mention button: move the cursor to the end, insert a chip (token) in the bot's color, add a space. On send the token's text (@name) goes into the message.
   insertMention(bot) {
     const end = this.input.content().text.length;
     this.input.set_selected_range({ start: end, end });
@@ -256,8 +256,8 @@ export default class BotRoom extends View {
     openOverlay({ kind: "window", mod: "bot-room", key: `room-${this.room}`, keep: true, width: minimized ? 320 : 620, height: minimized ? 52 : 720, props: { room: this.room, minimized } });
   }
 
-  // 방 멤버 @멘션을 티켓 링크처럼 링크로 바꾼다(bot:<id>). 누르면 그 봇의 채팅 창이 열린다.
-  // TextView 는 CSS 를 받지 않아 봇별 색은 못 입히고 테마 링크 색으로 보인다.
+  // Turn @mentions of room members into links (bot:<id>), like ticket links; a click opens that bot's chat window.
+  // TextView takes no CSS, so links use the theme's link color, not the bot's color.
   markdown(text) {
     const titles = shared("bots.titles") ?? {};
     return text.replace(/@([^\s@,.!?:;()[\]「」]+)/g, (whole, word) => {
@@ -269,7 +269,7 @@ export default class BotRoom extends View {
   messageText(id, text) {
     return TextView.markdown(id, this.markdown(text)).on_link_click((url) => {
       if (/^https?:\/\//i.test(url)) { exec("/usr/bin/open", [url]).catch(() => {}); return; }
-      // 링크는 봇이 쓴 글에서도 온다: 알려진 봇 id 만 연다.
+      // Links can come from text a bot wrote: open only bots that are members.
       const bot = url.startsWith("bot:") ? url.slice(4) : "";
       if (!this.meta.members.includes(bot)) return;
       openOverlay({ kind: "window", mod: "bot-chat", key: `chat-${bot}`, keep: true, width: 520, height: 680, props: { bot } });
@@ -295,13 +295,13 @@ export default class BotRoom extends View {
         .when(Boolean(m.needs), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(tr("확인이 필요해요 — 이 방에 답해 주세요", "Needs you — reply in this room")))));
   }
 
-  // 봇이 다른 봇을 부른 전달 한 줄: 「리뷰봇 → 배포봇 전달 · 2/3」(라운드)
+  // One line for a bot calling another bot: "Reviewer -> Deployer · 2/3" (rounds)
   handoffRow(send, from, t) {
     return h_flex().w_full().justify_center().child(div().px(12).py(2).rounded(999).border_1().border_color(t.border)
       .text_size(11.5).text_color(t.muted).child(tr(`${this.title(from)} → ${this.title(send.bot)} 전달 · ${send.hop}/${ROUNDS}`, `${this.title(from)} → ${this.title(send.bot)} · round ${send.hop}/${ROUNDS}`)));
   }
 
-  // 정지: 기록을 남겨 전달기가 그 이전 요청을 더 진행하지 않게 하고, 일하는 멤버의 이 방 세션을 멈춘다.
+  // Stop: record it so the relay does not continue earlier requests, and stop working members' sessions for this room.
   async stopRoom(cx) {
     await botsdb("room-append", this.room, JSON.stringify({ t: "stop", id: newId(), at: new Date().toISOString() }));
     for (const bot of this.meta.members) {
@@ -319,7 +319,7 @@ export default class BotRoom extends View {
     cx.notify();
   }
 
-  // 일시정지(봇 답 상한)된 요청 중 아직 「계속」하지 않은 것.
+  // Requests paused at the bot reply limit that have not been continued.
   pausedRoots() {
     const continues = (root) => this.events.filter((e) => e.t === "continue" && e.id === root).length;
     const stopSeq = Math.max(0, ...this.events.filter((e) => e.t === "stop").map((e) => e.seq ?? 0));
@@ -371,7 +371,7 @@ export default class BotRoom extends View {
     const items = [];
     for (const e of this.events) {
       if (e.t === "msg") items.push(line(e.from === "owner" ? this.ownerRow(e, t) : this.botRow(e, t)));
-      // 사람이 보낸 말의 전달은 굳이 보이지 않는다. 봇이 봇을 부른 것만 한 줄로.
+      // Relaying a human message needs no line; only a bot calling a bot is shown.
       if (e.t === "send" && msgs.get(e.id)?.from && msgs.get(e.id).from !== "owner") items.push(line(this.handoffRow(e, msgs.get(e.id).from, t), 2, 2));
     }
     if (items.length === 0) items.push(line(div().text_color(t.dim).child(this.meta.members.length ? tr("첫 메시지를 보내 보세요. @이름으로 봇을 고를 수 있습니다.", "Send the first message. @name picks a bot.") : tr("「+ 봇 추가」로 이 방에 봇을 넣으세요. 처음 넣은 봇이 방장입니다.", "Add bots with “+ Add bot”. The first one becomes the host."))));
