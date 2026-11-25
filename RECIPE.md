@@ -61,6 +61,8 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
 
 ## Watch out
 
+- The mods need the runtime in `runtime/` (`herdr-bot`, `botsdb`, `botsmem`, `RULES.md` in `~/.herdr-bots/`): copying only
+  `layouts/` and `mods/` shows the sidebar but cannot make or start bots. Run `./install.sh` from a clone of the repo.
 - `terminal.park` ends a `--no-parent` terminal: keep the bot in a settled tab and hide it in the tab bar instead.
   Shipped `tabs` lists settled tabs, hence `tabs-bots`.
 - `scroll_to_item` only reaches direct children of the scroll element: give every message row its own wrapper.
