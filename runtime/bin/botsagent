@@ -1,0 +1,868 @@
+#!/usr/bin/python3 -I
+"""Agent providers for herdr bots: how to start each CLI and how to read its conversations.
+
+  botsagent providers                   providers with their models and efforts -> [{id, label, installed, models, efforts, ...}]
+  botsagent exec <bot> [session] [room] replace this process with the bot's agent (herdr-bot runs it inside an hc terminal)
+  botsagent chat-session <bot>          the 1:1 session -> {"id", "file"} (room sessions excluded)
+  botsagent sessions <bot>              the 1:1 sessions, newest first (latest 30)
+  botsagent transcript <bot> [session]  the session's messages -> {"stamp", "born", "messages": [{id, role, text, tools, at}]}
+  botsagent reply <bot> <room|-> <session|-> <marker>   the reply to the message carrying marker -> null | {"text"} | {"silent": true}
+  botsagent last-reply <bot>            the last bot text of the 1:1 session
+  botsagent watch-dirs                  folders where the bots' conversations change
+  botsagent use <bot> <provider>        switch the bot to that agent with its default model and effort
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+
+HOME = os.path.expanduser("~/.herdr-bots")
+BIN = os.path.dirname(os.path.realpath(__file__))
+TAIL = 800       # transcript records read for the chat window
+SESSIONS = 30
+
+
+def load_botsdb():
+    sys.dont_write_bytecode = True   # do not leave __pycache__ next to the installed scripts
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    loader = SourceFileLoader("botsdb", os.path.join(BIN, "botsdb"))
+    spec = importlib.util.spec_from_loader("botsdb", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+botsdb = load_botsdb()
+
+
+def iso_ms(value):
+    try:
+        return int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    except (AttributeError, ValueError):
+        return None
+
+
+def one_line(value, limit=140):
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def tool_detail(data):
+    """One tool call on one line: its command, file, query or URL, whichever it has."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return one_line(data)
+    if not isinstance(data, dict):
+        return one_line(data)
+    for key in ("command", "cmd", "file_path", "path", "pattern", "query", "jql", "url", "description"):
+        if data.get(key):
+            value = data[key]
+            return one_line(" ".join(value) if isinstance(value, list) else value)
+    return one_line(next((v for v in data.values() if isinstance(v, str)), ""))
+
+
+def unwrap(text):
+    """hc send records messages as <hc from="…">text</hc>, whatever the agent; Claude Code records a multi-line one as
+    <pasted_content id="…">text</pasted_content id="…">."""
+    found = re.match(r'^\s*<hc from="[^"]*">([\s\S]*)</hc>\s*$', text)
+    text = found.group(1) if found else text
+    pasted = re.match(r'^\s*<pasted_content id="[^"]*">\n?([\s\S]*?)\n?</pasted_content[^>]*>\s*$', text)
+    return (pasted.group(1) if pasted else text), bool(found)
+
+
+def user_entry(id_, text, at):
+    text, wrapped = unwrap(text)
+    # Internal messages such as <command-name>, <environment_context> or injected instructions are not conversation.
+    if not text.strip() or text.lstrip().startswith(("<", "# AGENTS.md instructions")):
+        return None
+    scheduled = re.match(r"^\[(스케줄|schedule)\]\s*", text)
+    return {"id": id_, "role": "user", "text": text[scheduled.end():] if scheduled else text, "at": at,
+            "source": "schedule" if scheduled else None, "hc": wrapped}
+
+
+class Turns:
+    """Collects records into user messages and assistant turns (consecutive assistant records form one turn)."""
+
+    def __init__(self):
+        self.out = []
+
+    def user(self, entry):
+        if entry:
+            self.out.append(entry)
+
+    def assistant(self, id_, at, text="", tool=None, final=None):
+        turn = self.out[-1] if self.out and self.out[-1]["role"] == "assistant" else None
+        if turn is None:
+            turn = {"id": id_, "role": "assistant", "text": "", "tools": [], "at": at, "final": ""}
+            self.out.append(turn)
+        if text and text.strip():
+            turn["text"] += ("\n\n" if turn["text"] else "") + text
+        if final and final.strip():
+            turn["final"] = final
+        if tool:
+            turn["tools"].append(tool)
+
+    def messages(self):
+        return [m for m in self.out if m["role"] == "user" or m["text"] or m["tools"]]
+
+
+def tail_lines(path, n):
+    """The last n lines of a transcript; .zst files are decompressed with zstd (sessions Codex has closed)."""
+    if path.endswith(".zst"):
+        if not shutil.which("zstd"):
+            return []
+        r = subprocess.run(["zstd", "-dcq", path], capture_output=True, text=True, errors="replace")
+        lines = r.stdout.splitlines()
+    else:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return []
+    return lines[-n:] if n else lines
+
+
+def records(path, n=TAIL):
+    for line in tail_lines(path, n):
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+# ── Providers ─────────────────────────────────────────────────
+
+class Provider:
+    id = ""
+    label = ""
+    command = ""
+    persona = "AGENTS.md"
+    new_chat = "/new"
+    models = []
+    efforts = []
+    default_model = ""
+    default_effort = ""
+    preassigns_session = False   # can a new session be given our id up front
+    tested = False
+
+    def installed(self):
+        return bool(shutil.which(self.command, path=agent_path()))
+
+    def describe(self):
+        return {"id": self.id, "label": self.label, "installed": self.installed(), "tested": self.tested,
+                "models": self.model_list(), "efforts": self.efforts,
+                "default_model": self.default_model, "default_effort": self.default_effort, "new_chat": self.new_chat}
+
+    def model_list(self):
+        return self.models
+
+    def argv(self, model, effort, session, new):
+        raise NotImplementedError
+
+    def session_files(self, home):
+        """[(session id, path)] of this bot folder, newest first."""
+        raise NotImplementedError
+
+    def parse(self, path, n=TAIL):
+        raise NotImplementedError
+
+    def title(self, path):
+        first = next((m for m in self.parse(path, 0) if m["role"] == "user"), None)
+        return one_line(re.sub(r"<[^>]+>", "", first["text"]) if first else "", 40) or "(untitled)"
+
+    def watch_dir(self, home):
+        raise NotImplementedError
+
+    def mtime(self, path):
+        return os.path.getmtime(path)
+
+
+DEFAULT = "default"   # model or effort left to the agent's own settings: no flag is passed
+
+
+def flag(name, value):
+    return [] if not value or value == DEFAULT else [name, value]
+
+
+class Claude(Provider):
+    id, label, command = "claude", "Claude Code", "claude"
+    persona, new_chat = "CLAUDE.md", "/clear"
+    models = [["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"]]
+    efforts = ["low", "medium", "high", "xhigh", "max"]
+    default_model, default_effort = "claude-sonnet-5-5", "low"
+    preassigns_session = True
+    tested = True
+
+    def folder(self, home):
+        # Claude Code names transcript folders after the cwd with every non-alphanumeric character turned into "-".
+        return os.path.expanduser("~/.claude/projects/" + "".join(c if c.isalnum() else "-" for c in home))
+
+    def watch_dir(self, home):
+        return self.folder(home)
+
+    def argv(self, model, effort, session, new):
+        argv = ["claude", "--model", model, "--effort", effort, "--permission-mode", os.environ.get("HERDR_BOT_PERMISSION") or "auto"]
+        if session:
+            argv += ["--session-id" if new else "--resume", session]
+        return argv
+
+    def session_files(self, home):
+        folder = self.folder(home)
+        files = glob.glob(os.path.join(folder, "*.jsonl"))
+        files.sort(key=os.path.getmtime, reverse=True)
+        return [(os.path.basename(f)[:-6], f) for f in files]
+
+    def parse(self, path, n=TAIL):
+        turns = Turns()
+        for d in records(path, n):
+            if d.get("isSidechain") or d.get("isMeta"):
+                continue
+            at = iso_ms(d.get("timestamp"))
+            content = (d.get("message") or {}).get("content")
+            if d.get("type") == "user" and isinstance(content, str):
+                turns.user(user_entry(d.get("uuid"), content, at))
+            elif d.get("type") == "assistant" and isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "text":
+                        turns.assistant(d.get("uuid"), at, text=part.get("text", ""))
+                    elif part.get("type") == "tool_use":
+                        name = re.sub(r"^mcp__[^_]+(?:_[^_]+)*__", "", part.get("name", ""))
+                        turns.assistant(d.get("uuid"), at, tool={"name": name, "detail": tool_detail(part.get("input"))})
+        return turns.messages()
+
+    def title(self, path):
+        title = ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"type":"custom-title"' in line:
+                    try:
+                        title = json.loads(line).get("customTitle") or title
+                    except ValueError:
+                        pass
+        # Older herdr-bot started bots with -n bot-<bot>, which overwrote the session name; do not use that name as a title.
+        return title if title and not title.startswith("bot-") else super().title(path)
+
+
+class Codex(Provider):
+    id, label, command = "codex", "Codex", "codex"
+    efforts = ["low", "medium", "high", "xhigh", "max"]
+    default_effort = "low"
+    tested = True
+
+    @property
+    def default_model(self):
+        # The model set in ~/.codex/config.toml, else the first one Codex offers.
+        try:
+            with open(os.path.expanduser("~/.codex/config.toml")) as f:
+                found = re.search(r'^model\s*=\s*"([^"]+)"', f.read(), re.M)
+            if found:
+                return found.group(1)
+        except OSError:
+            pass
+        return "gpt-6.1-sol"
+
+    def model_list(self):
+        # Codex keeps the models offered to this account in a cache; fall back to the default when it is missing.
+        try:
+            with open(os.path.expanduser("~/.codex/models_cache.json")) as f:
+                data = json.load(f)
+            listed = [[m["slug"], m.get("display_name") or m["slug"]] for m in data.get("models", data) if m.get("visibility") == "list"]
+            return listed or [[self.default_model, self.default_model]]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return [[self.default_model, self.default_model]]
+
+    def watch_dir(self, home):
+        return os.path.expanduser("~/.codex/sessions")
+
+    def argv(self, model, effort, session, new):
+        # --no-daemon: under hc the shared background server would outlive and detach from the terminal.
+        # No update prompt: nobody is at a bot's terminal to answer it.
+        flags = ["--no-daemon", "-m", model, "-c", f'model_reasoning_effort="{effort}"', "-c", "check_for_update_on_startup=false",
+                 "--approve-for-me"]
+        # Codex picks its own session id, so a new session starts without one; reply() records it once the first reply lands.
+        return ["codex", "resume", *flags, session] if session and not new else ["codex", *flags]
+
+    def session_files(self, home):
+        cache_path = os.path.join(HOME, ".cache", "codex-cwd.json")
+        try:
+            with open(cache_path) as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+        since = os.stat(home).st_ctime - 60
+        found, changed = [], False
+        for path in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl*")):
+            name = os.path.basename(path)
+            # rollout-<time>-<id>.jsonl; <id>_<child id> files are sub-agent threads.
+            match = re.match(r"rollout-[\dT-]+?-([0-9a-f-]{36})\.jsonl(\.zst)?$", name)
+            if not match or os.path.getmtime(path) < since:
+                continue
+            if path not in cache:
+                meta = next(iter(records_head(path)), {})
+                cache[path] = (meta.get("payload") or {}).get("cwd") if meta.get("type") == "session_meta" else None
+                changed = True
+            if cache[path] == home:
+                found.append((match.group(1), path))
+        if changed:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(cache, f)
+        # An open session and its compressed copy can both exist briefly: keep the plain file.
+        best = {}
+        for sid, path in found:
+            if sid not in best or best[sid].endswith(".zst"):
+                best[sid] = path
+        return sorted(best.items(), key=lambda item: os.path.getmtime(item[1]), reverse=True)
+
+    def parse(self, path, n=TAIL):
+        rows = list(records(path, n))
+        # Newer Codex logs whole items (item_completed); older rollouts only have the model messages (response_item).
+        items = any(d.get("type") == "event_msg" and (d.get("payload") or {}).get("type") == "item_completed" for d in rows)
+        turns = Turns()
+        for d in rows:
+            p = d.get("payload") or {}
+            at = iso_ms(d.get("timestamp"))
+            if items:
+                if d.get("type") != "event_msg" or p.get("type") != "item_completed":
+                    continue
+                item = p.get("item") or {}
+                kind, iid = item.get("type"), item.get("id")
+                text = "".join(c.get("text", "") for c in item.get("content") or [] if isinstance(c, dict))
+                if kind == "UserMessage":
+                    turns.user(user_entry(iid, text, at))
+                elif kind == "AgentMessage":
+                    turns.assistant(iid, at, text=text, final=text if item.get("phase") == "final_answer" else None)
+                elif kind not in ("Reasoning", "ContextCompaction"):
+                    name = item.get("tool") or item.get("name") or {"CommandExecution": "shell", "FileChange": "edit", "WebSearch": "web search"}.get(kind, kind)
+                    detail = item.get("command") or item.get("query") or item.get("arguments") or item.get("changes") or ""
+                    turns.assistant(iid, at, tool={"name": name, "detail": tool_detail(detail)})
+            elif d.get("type") == "response_item":
+                if p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+                    text = "".join(c.get("text", "") for c in p.get("content") or [] if isinstance(c, dict))
+                    if p["role"] == "user":
+                        turns.user(user_entry(p.get("id"), text, at))
+                    else:
+                        turns.assistant(p.get("id"), at, text=text, final=text if p.get("phase") == "final_answer" else None)
+                elif p.get("type") in ("function_call", "custom_tool_call", "local_shell_call"):
+                    turns.assistant(p.get("id") or p.get("call_id"), at,
+                                    tool={"name": p.get("name") or "shell", "detail": tool_detail(p.get("arguments") or p.get("input") or p.get("action"))})
+        return turns.messages()
+
+
+# ── Providers built from public docs and source (2026-11-25), not run here: see the README. ──
+
+def jsonl_files(pattern):
+    files = glob.glob(os.path.expanduser(pattern))
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
+
+
+def text_of(content):
+    """A message body that is a string or a list of {type: text, text} parts."""
+    if isinstance(content, str):
+        return content
+    return "".join(c.get("text", "") for c in content or [] if isinstance(c, dict) and c.get("type", "text") == "text")
+
+
+class Pi(Provider):
+    id, label, command = "pi", "Pi", "pi"
+    models, efforts = [[DEFAULT, "Default"]], [DEFAULT, "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    default_model, default_effort = DEFAULT, DEFAULT
+    preassigns_session = True
+
+    def folder(self, home):
+        return os.path.expanduser("~/.pi/agent/sessions/--" + re.sub(r"[/\\:]", "-", home.lstrip("/")) + "--")
+
+    def watch_dir(self, home):
+        return self.folder(home)
+
+    def argv(self, model, effort, session, new):
+        # Pi asks for no tool approval at all.
+        return ["pi", *flag("--model", model), *flag("--thinking", effort), *flag("--session-id" if new else "--session", session)]
+
+    def session_files(self, home):
+        out = []
+        for path in jsonl_files(os.path.join(self.folder(home), "*_*.jsonl")):
+            out.append((os.path.basename(path)[:-6].split("_", 1)[1], path))
+        return out
+
+    def parse(self, path, n=TAIL):
+        turns = Turns()
+        for d in records(path, n):
+            msg = d.get("message") or {}
+            if d.get("type") != "message":
+                continue
+            at = iso_ms(d.get("timestamp"))
+            if msg.get("role") == "user":
+                turns.user(user_entry(d.get("id"), text_of(msg.get("content")), at))
+            elif msg.get("role") == "assistant":
+                for part in msg.get("content") or []:
+                    if part.get("type") == "text":
+                        turns.assistant(d.get("id"), at, text=part.get("text", ""))
+                    elif part.get("type") == "toolCall":
+                        turns.assistant(d.get("id"), at, tool={"name": part.get("name", ""), "detail": tool_detail(part.get("arguments"))})
+        return turns.messages()
+
+
+class Copilot(Provider):
+    id, label, command = "copilot", "Copilot", "copilot"
+    models, efforts = [["auto", "Auto"]], ["low", "medium", "high", "xhigh", "max"]
+    default_model, default_effort = "auto", "low"
+    preassigns_session = True
+
+    def watch_dir(self, home):
+        return os.path.expanduser("~/.copilot/session-state")
+
+    def argv(self, model, effort, session, new):
+        # --session-id resumes the session when it exists and creates it (a UUID) when it does not.
+        return ["copilot", *flag("--model", model), *flag("--effort", effort), "--allow-all-tools", *flag("--session-id", session)]
+
+    def session_files(self, home):
+        out = []
+        for path in jsonl_files("~/.copilot/session-state/*/events.jsonl"):
+            start = next((d for d in records_head(path) if d.get("type") == "session.start"), {})
+            context = (start.get("data") or {}).get("context") or {}
+            if home in (context.values() if isinstance(context, dict) else [context]):
+                out.append((os.path.basename(os.path.dirname(path)), path))
+        return out
+
+    def parse(self, path, n=TAIL):
+        turns = Turns()
+        for d in records(path, n):
+            data, at = d.get("data") or {}, iso_ms(d.get("timestamp"))
+            if d.get("type") == "user.message":
+                turns.user(user_entry(d.get("id"), data.get("content") or "", at))
+            elif d.get("type") == "assistant.message":
+                turns.assistant(d.get("id"), at, text=data.get("content") or "")
+                for call in data.get("toolRequests") or []:
+                    turns.assistant(d.get("id"), at, tool={"name": call.get("name", ""), "detail": tool_detail(call.get("arguments"))})
+        return turns.messages()
+
+
+class Grok(Provider):
+    id, label, command = "grok", "Grok", "grok"
+    models, efforts = [[DEFAULT, "Default"]], [DEFAULT, "none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    default_model, default_effort = DEFAULT, DEFAULT
+    preassigns_session = True
+
+    def folder(self, home):
+        from urllib.parse import quote
+        return os.path.expanduser("~/.grok/sessions/" + quote(home, safe=""))
+
+    def watch_dir(self, home):
+        return self.folder(home)
+
+    def argv(self, model, effort, session, new):
+        return ["grok", *flag("-m", model), *flag("--effort", effort), "--permission-mode", "auto",
+                *flag("--session-id" if new else "-r", session)]
+
+    def session_files(self, home):
+        return [(os.path.basename(os.path.dirname(p)), p) for p in jsonl_files(os.path.join(self.folder(home), "*", "updates.jsonl"))]
+
+    def parse(self, path, n=0):
+        # The log is a stream of chunks without ids or times: whole-file line numbers are the ids.
+        turns, user = Turns(), None
+        for i, d in enumerate(records(path, 0)):
+            update = ((d.get("params") or {}).get("update")) or {}
+            kind, text = update.get("sessionUpdate"), (update.get("content") or {}).get("text", "")
+            if kind == "user_message_chunk":
+                user = user if user else {"id": f"u{i}", "text": ""}
+                user["text"] += text
+                continue
+            if user:
+                turns.user(user_entry(user["id"], user["text"], None))
+                user = None
+            if kind == "agent_message_chunk":
+                turn = turns.out[-1] if turns.out and turns.out[-1]["role"] == "assistant" else None
+                if turn is not None and turn["text"] and not turn.get("_tool"):
+                    turn["text"] += text
+                else:
+                    turns.assistant(f"a{i}", None, text=text)
+                    turns.out[-1]["_tool"] = False
+            elif kind == "tool_call":
+                turns.assistant(f"a{i}", None, tool={"name": update.get("kind") or "tool", "detail": one_line(update.get("title"))})
+                turns.out[-1]["_tool"] = True
+        if user:
+            turns.user(user_entry(user["id"], user["text"], None))
+        return turns.messages()
+
+
+class Kimi(Provider):
+    id, label, command = "kimi", "Kimi", "kimi"
+    models, efforts = [[DEFAULT, "Default"]], ["on", "off"]
+    default_model, default_effort = DEFAULT, "off"
+    preassigns_session = True
+
+    def folder(self, home):
+        import hashlib
+        return os.path.expanduser("~/.kimi/sessions/" + hashlib.md5(home.encode()).hexdigest())
+
+    def watch_dir(self, home):
+        return self.folder(home)
+
+    def argv(self, model, effort, session, new):
+        # --session creates the session with that id when it does not exist yet.
+        return ["kimi", *flag("-m", model), "--thinking" if effort == "on" else "--no-thinking", "--yolo", *flag("--session", session)]
+
+    def session_files(self, home):
+        return [(os.path.basename(os.path.dirname(p)), p) for p in jsonl_files(os.path.join(self.folder(home), "*", "context.jsonl"))]
+
+    def parse(self, path, n=0):
+        # context.jsonl has no ids or times: line numbers are the ids.
+        turns = Turns()
+        for i, d in enumerate(records(path, 0)):
+            if d.get("role") == "user":
+                turns.user(user_entry(f"l{i}", text_of(d.get("content")), None))
+            elif d.get("role") == "assistant":
+                turns.assistant(f"l{i}", None, text=text_of(d.get("content")))
+                for call in d.get("tool_calls") or []:
+                    fn = call.get("function") or {}
+                    turns.assistant(f"l{i}", None, tool={"name": fn.get("name", ""), "detail": tool_detail(fn.get("arguments"))})
+        return turns.messages()
+
+
+class Crush(Provider):
+    id, label, command = "crush", "Crush", "crush"
+    models, efforts = [[DEFAULT, "Default"]], [DEFAULT]   # the interactive command takes the model from Crush's config only
+    default_model, default_effort = DEFAULT, DEFAULT
+
+    def db(self, home):
+        return os.path.join(home, ".crush", "crush.db")
+
+    def watch_dir(self, home):
+        return os.path.join(home, ".crush")
+
+    def argv(self, model, effort, session, new):
+        return ["crush", "--yolo", *flag("-s", None if new else session)]
+
+    def query(self, path, sql, args=()):
+        import sqlite3
+        db = sqlite3.connect("file:" + path.split("#")[0] + "?mode=ro", uri=True)
+        try:
+            return db.execute(sql, args).fetchall()
+        finally:
+            db.close()
+
+    def session_files(self, home):
+        path = self.db(home)
+        if not os.path.exists(path):
+            return []
+        rows = self.query(path, "select id from sessions where parent_session_id is null order by updated_at desc")
+        return [(sid, f"{path}#{sid}") for (sid,) in rows]
+
+    def mtime(self, path):
+        rows = self.query(path, "select updated_at from sessions where id = ?", (path.split("#")[1],))
+        return float(rows[0][0]) if rows else 0.0
+
+    def parse(self, path, n=TAIL):
+        turns = Turns()
+        rows = self.query(path, "select id, role, parts, created_at from messages where session_id = ? order by created_at, rowid",
+                          (path.split("#")[1],))
+        for mid, role, parts, created in rows[-n:] if n else rows:
+            try:
+                parts = json.loads(parts or "[]")
+            except ValueError:
+                continue
+            at = int(created) * 1000 if created else None
+            texts = "".join((p.get("data") or {}).get("text", "") for p in parts if p.get("type") == "text")
+            if role == "user":
+                turns.user(user_entry(mid, texts, at))
+            elif role == "assistant":
+                turns.assistant(mid, at, text=texts)
+                for p in parts:
+                    if p.get("type") == "tool_call":
+                        data = p.get("data") or {}
+                        turns.assistant(mid, at, tool={"name": data.get("name", ""), "detail": tool_detail(data.get("input"))})
+        return turns.messages()
+
+
+class Gemini(Provider):
+    id, label, command = "gemini", "Gemini", "gemini"
+    persona = "GEMINI.md"
+    new_chat = "/clear"
+    models, efforts = [[DEFAULT, "Default"], ["gemini-2.5-pro", "2.5 Pro"], ["gemini-2.5-flash", "2.5 Flash"]], [DEFAULT]
+    default_model, default_effort = DEFAULT, DEFAULT
+    preassigns_session = True
+
+    def folders(self, home):
+        """Gemini names project folders through ~/.gemini/projects.json (older versions: sha256 of the path)."""
+        import hashlib
+        names = [hashlib.sha256(home.encode()).hexdigest()]
+        try:
+            with open(os.path.expanduser("~/.gemini/projects.json")) as f:
+                registry = json.load(f)
+            registry = registry.get("projects", registry) if isinstance(registry, dict) else {}
+            if isinstance(registry.get(home), str):
+                names.append(registry[home])
+        except (OSError, ValueError, AttributeError):
+            pass
+        return [os.path.expanduser(f"~/.gemini/tmp/{name}/chats") for name in names]
+
+    def watch_dir(self, home):
+        return os.path.expanduser("~/.gemini/tmp")
+
+    def argv(self, model, effort, session, new):
+        return ["gemini", *flag("-m", model), "--approval-mode", "auto_edit", *flag("--session-id" if new else "--resume", session)]
+
+    def session_files(self, home):
+        out = []
+        for folder in self.folders(home):
+            for path in jsonl_files(os.path.join(folder, "session-*.jsonl")):
+                meta = next((d for d in records_head(path) if d.get("sessionId")), {})
+                out.append((meta.get("sessionId") or os.path.basename(path), path))
+        return out
+
+    def parse(self, path, n=TAIL):
+        turns = Turns()
+        for d in records(path, n):
+            # Lines such as {"$set": …} or {"$patch": …} edit earlier records; they are skipped, so an edited message shows as first written.
+            at = iso_ms(d.get("timestamp"))
+            if d.get("type") == "user":
+                turns.user(user_entry(d.get("id"), text_of(d.get("content")), at))
+            elif d.get("type") == "gemini":
+                turns.assistant(d.get("id"), at, text=text_of(d.get("content")))
+                for call in d.get("toolCalls") or []:
+                    turns.assistant(d.get("id"), at, tool={"name": call.get("name", ""), "detail": tool_detail(call.get("args"))})
+        return turns.messages()
+
+
+def records_head(path):
+    if path.endswith(".zst"):
+        if not shutil.which("zstd"):
+            return []
+        r = subprocess.run(["sh", "-c", 'zstd -dcq "$1" | head -1', "_", path], capture_output=True, text=True, errors="replace")
+        lines = r.stdout.splitlines()
+    else:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [f.readline()]
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+PROVIDERS = {p.id: p for p in (Claude(), Codex(), Pi(), Copilot(), Grok(), Kimi(), Crush(), Gemini())}
+
+
+def agent_path():
+    return os.pathsep.join([os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.claude/bin"), "/opt/homebrew/bin",
+                            "/usr/local/bin", "/usr/bin", "/bin", os.environ.get("PATH", "")])
+
+
+# ── Bots ─────────────────────────────────────────────────
+
+def bot_home(bot):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,23}", bot or ""):
+        raise SystemExit(f"botsagent: bad bot name: {bot}")
+    return os.path.join(HOME, bot)
+
+
+def config(db, bot):
+    row = db.execute("select model, effort, provider from bots where id = ?", (bot,)).fetchone()
+    provider = PROVIDERS.get((row and row["provider"]) or "claude", PROVIDERS["claude"])
+    model = os.environ.get("HERDR_BOT_MODEL") or (row and row["model"]) or provider.default_model
+    effort = os.environ.get("HERDR_BOT_EFFORT") or (row and row["effort"]) or provider.default_effort
+    return provider, model, effort
+
+
+def room_sessions(db, bot):
+    return {r[0] for r in db.execute("select session_id from room_members where bot = ? and session_id is not null", (bot,))}
+
+
+def chat_files(db, bot):
+    provider, _, _ = config(db, bot)
+    rooms = room_sessions(db, bot)
+    result = []
+    for sid, path in provider.session_files(bot_home(bot)):
+        if sid in rooms:
+            continue
+        # A Codex room session only gets its id after its first reply: recognise it by its first message.
+        first = next((m for m in provider.parse(path, 60) if m["role"] == "user"), None) if not provider.preassigns_session else None
+        if first and first["text"].startswith(("[room:", "[방:")):
+            continue
+        result.append((sid, path))
+    return provider, result
+
+
+def session_file(provider, bot, session):
+    return next((path for sid, path in provider.session_files(bot_home(bot)) if sid == session), None)
+
+
+def sessions(db, bot):
+    provider, files = chat_files(db, bot)
+    known = {r["session_id"]: r for r in db.execute("select session_id, title, last_at from sessions where bot = ?", (bot,))}
+    result = []
+    for i, (sid, path) in enumerate(files[:SESSIONS]):
+        mtime = provider.mtime(path)
+        row = known.get(sid)
+        # Only reread titles of sessions whose transcript changed (do not scan large files every time).
+        if row is None or row["last_at"] != mtime:
+            title = provider.title(path)
+            db.execute("insert into sessions (bot, session_id, title, last_at) values (?, ?, ?, ?) "
+                       "on conflict (bot, session_id) do update set title = excluded.title, last_at = excluded.last_at", (bot, sid, title, mtime))
+        else:
+            title = row["title"]
+        result.append({"id": sid, "title": title, "at": mtime, "current": i == 0})
+    db.commit()
+    return result
+
+
+def transcript(db, bot, session):
+    provider, files = chat_files(db, bot)
+    path = session_file(provider, bot, session) if session else (files[0][1] if files else None)
+    dir_ = provider.watch_dir(bot_home(bot))
+    real = path.split("#")[0] if path else None
+    if not real or not os.path.exists(real):
+        return {"stamp": "", "born": 0, "messages": [], "dir": dir_}
+    st = os.stat(real)
+    return {"stamp": f"{path}:{provider.mtime(path)}:{st.st_size}", "born": int(getattr(st, "st_birthtime", st.st_ctime) * 1000),
+            "messages": provider.parse(path), "dir": dir_}
+
+
+def answer_after(messages, marker):
+    """The reply to the user message carrying marker; None while there is none yet."""
+    start = next((i for i in range(len(messages) - 1, -1, -1)
+                  if messages[i]["role"] == "user" and marker in messages[i]["text"]), None)
+    if start is None:
+        return None
+    replies = []
+    for m in messages[start + 1:]:
+        if m["role"] == "user":
+            break
+        replies.append(m)
+    if not replies:
+        return None
+    last = replies[-1]
+    # The text after the last tool call is the reply; with no final mark, the last paragraph of the turn.
+    text = (last.get("final") or last["text"].split("\n\n")[-1] if last["text"] else "").strip()
+    if not text or re.fullmatch(r"(조용|quiet)[.!。]?", text, re.I):
+        return {"silent": True}
+    return {"text": text}
+
+
+def conversation_since(bot, since_s):
+    """(at seconds, role, entry) of every session (1:1 and rooms) changed after since_s; for reflection."""
+    db = botsdb.connect()
+    provider, _, _ = config(db, bot)
+    db.close()
+    entries = []
+    for _, path in provider.session_files(bot_home(bot)):
+        if provider.mtime(path) <= since_s:
+            continue
+        for m in provider.parse(path, 0):
+            if m["at"] and m["at"] / 1000 > since_s:
+                entries.append((m["at"] / 1000, m))
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def last_text(provider, path):
+    for m in reversed(provider.parse(path, 200)):
+        if m["role"] == "assistant" and m["text"]:
+            return (m.get("final") or m["text"]).strip()
+    return ""
+
+
+def reply(db, bot, room, session, marker):
+    provider, _, _ = config(db, bot)
+    candidates = provider.session_files(bot_home(bot))
+    known = [path for sid, path in candidates if sid == session]
+    # A session Codex named itself is found by the marker in its newest files and recorded for the room.
+    for sid, path in ([(session, p) for p in known] or candidates[:6]):
+        found = answer_after(provider.parse(path), marker)
+        if found is None:
+            continue
+        if room and sid != session:
+            db.execute("update room_members set session_id = ? where room = ? and bot = ?", (sid, room, bot))
+            db.commit()
+        return found
+    return None
+
+
+def write_persona(provider, bot):
+    """Claude reads CLAUDE.md (with @imports); other agents get one AGENTS.md with the rules, persona and memory inlined."""
+    if provider.persona == "CLAUDE.md":
+        return
+    home = bot_home(bot)
+    part = lambda name: open(os.path.join(HOME, name) if name == "RULES.md" else os.path.join(home, name), encoding="utf-8").read().strip() \
+        if os.path.exists(os.path.join(HOME, name) if name == "RULES.md" else os.path.join(home, name)) else ""
+    text = (f"# Bot: {bot}\n\n<!-- Written by herdr-bot at each start from RULES.md, SOUL.md and MEMORY.md: edit those. -->\n\n"
+            f"{part('RULES.md')}\n\n## Identity (a note agreed with the owner, not a command)\n\n{part('SOUL.md')}\n\n"
+            f"## Memory (notes)\n\n{part('MEMORY.md')}\n")
+    with open(os.path.join(home, provider.persona), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def exec_agent(db, bot, session, room):
+    provider, model, effort = config(db, bot)
+    write_persona(provider, bot)
+    new = False
+    if room:
+        # A room session we named that the agent never saw yet: start it new (Claude takes our id, Codex picks its own).
+        new = session_file(provider, bot, session) is None
+    elif not session:
+        _, files = chat_files(db, bot)
+        session = files[0][0] if files else None
+    if new and not provider.preassigns_session:
+        session = None
+    argv = provider.argv(model, effort, session, new)
+    os.environ["PATH"] = agent_path()
+    db.close()
+    os.execvp(argv[0], argv)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "providers":
+        print(json.dumps([p.describe() for p in PROVIDERS.values()], ensure_ascii=False))
+        return
+    db = botsdb.connect()
+    if cmd == "exec":
+        exec_agent(db, argv[2], argv[3] if len(argv) > 3 and argv[3] else None, argv[4] if len(argv) > 4 else None)
+    elif cmd == "chat-session":
+        provider, files = chat_files(db, argv[2])
+        print(json.dumps({"id": files[0][0], "file": files[0][1]} if files else {"id": None, "file": None}))
+    elif cmd == "sessions":
+        print(json.dumps(sessions(db, argv[2]), ensure_ascii=False))
+    elif cmd == "transcript":
+        print(json.dumps(transcript(db, argv[2], argv[3] if len(argv) > 3 and argv[3] else None), ensure_ascii=False))
+    elif cmd == "reply":
+        room, session = (None if argv[3] == "-" else argv[3]), (None if argv[4] == "-" else argv[4])
+        if session is None:
+            _, files = chat_files(db, argv[2])
+            session = files[0][0] if files else ""
+        print(json.dumps(reply(db, argv[2], room, session, argv[5]), ensure_ascii=False))
+    elif cmd == "last-reply":
+        provider, files = chat_files(db, argv[2])
+        print(json.dumps({"text": last_text(provider, files[0][1]) if files else ""}, ensure_ascii=False))
+    elif cmd == "use":
+        provider = PROVIDERS.get(argv[3])
+        if not provider:
+            raise SystemExit(f"botsagent: provider must be one of {', '.join(PROVIDERS)}")
+        db.execute("update bots set provider = ?, model = ?, effort = ? where id = ?",
+                   (provider.id, provider.default_model, provider.default_effort, bot_home(argv[2]) and argv[2]))
+        db.commit()
+        print(json.dumps({"provider": provider.id, "model": provider.default_model, "effort": provider.default_effort}))
+    elif cmd == "watch-dirs":
+        dirs = set()
+        for bot in botsdb.bot_ids():
+            provider, _, _ = config(db, bot)
+            dirs.add(provider.watch_dir(bot_home(bot)))
+        print(json.dumps(sorted(dirs)))
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

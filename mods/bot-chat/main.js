@@ -1,18 +1,13 @@
-// Bot chat window: shows the bot's Claude Code transcript (JSONL) like a chat app; input goes to the bot terminal with hc send.
+// Bot chat window: shows the bot's agent session (Claude Code, Codex, … read by botsagent) like a chat app; input goes to the bot terminal with hc send.
 // Permission prompts and multiple-choice questions are not in the transcript, so when the bot needs you a card shows what it asks and hands off to the terminal.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea, ScrollHandle, TextView } from "gpui-base";
 import { props, agents, terminals, run, theme, exec, hc, home, checking, shared, closeOverlay, openOverlay, watchFolder } from "herdr";
 
-// Print "mtime ctime" of the transcript ($2's session, else the newest) on the first line, then its tail.
-// Transcripts can exceed 1 MiB, so use tail instead of readTextFile.
-const READ = 'if [ -n "$2" ]; then f="$1/$2.jsonl"; else f=$(ls -t "$1"/*.jsonl 2>/dev/null | head -1); fi; [ -f "$f" ] || exit 0; stat -f "%m %B" "$f"; tail -n 800 "$f"';
 const BIN = (h) => `${h}/.herdr-bots/bin/herdr-bot`;
 const BOTSDB = (h) => `${h}/.herdr-bots/bin/botsdb`;
-// Models and efforts the chat offers; the id goes to claude --model as is.
-const MODELS = [["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"]];
-const EFFORTS = ["low", "medium", "high"];
+const BOTSAGENT = (h) => `${h}/.herdr-bots/bin/botsagent`;
 const LAMB = "mods/bots/lamb.png";
 const COLUMN = 760;
 // UI text follows the system language (the Bots mod puts it in shared("bots.lang")): Korean when Korean comes first, English otherwise.
@@ -21,8 +16,6 @@ const WEEK_KO = ["일", "월", "화", "수", "목", "금", "토"];
 const WEEK_EN = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTH_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-// Claude Code names transcript folders after the cwd with every non-alphanumeric character turned into "-".
-const projectDir = (cwd) => `${home()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
 const pad = (n) => String(n).padStart(2, "0");
 const clock = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 const dayLabel = (date) => {
@@ -37,44 +30,10 @@ const dayLabel = (date) => {
 };
 const elapsed = (ms) => `${Math.floor(ms / 60000)}:${pad(Math.floor((ms % 60000) / 1000))}`;
 
-// One tool call on one line: its command, file, query or URL, whichever it has.
-function toolDetail(input = {}) {
-  const value = input.command ?? input.file_path ?? input.path ?? input.pattern ?? input.query ?? input.jql ?? input.url ?? input.description
-    ?? Object.values(input).find((v) => typeof v === "string");
-  return String(value ?? "").replace(/\s+/g, " ").slice(0, 140);
-}
-
-const shortTool = (name) => name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, "");
-
-function parse(lines) {
-  const out = [];
-  for (const line of lines) {
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
-    if (d.isSidechain || d.isMeta) continue;
-    const at = d.timestamp ? new Date(d.timestamp) : null;
-    const content = d.message?.content;
-    if (d.type === "user" && typeof content === "string") {
-      // Messages sent with hc send are recorded wrapped as <hc from="…">text</hc>.
-      const wrapped = /^<hc from="([^"]*)">([\s\S]*)<\/hc>$/.exec(content.trim());
-      const text = wrapped ? wrapped[2] : content;
-      // Internal messages such as <command-name> or <local-command-stdout> are not conversation.
-      if (text.trim().startsWith("<")) continue;
-      const scheduled = /^\[(스케줄|schedule)\]/.test(text);
-      out.push({ id: d.uuid, role: "user", text: scheduled ? text.replace(/^\[(스케줄|schedule)\]\s*/, "") : text, at, source: scheduled ? "schedule" : null });
-      continue;
-    }
-    if (d.type !== "assistant" || !Array.isArray(content)) continue;
-    let turn = out[out.length - 1];
-    if (!turn || turn.role !== "assistant") { turn = { id: d.uuid, role: "assistant", text: "", tools: [], details: [], at }; out.push(turn); }
-    for (const part of content) {
-      if (part.type === "text" && part.text.trim()) turn.text += (turn.text ? "\n\n" : "") + part.text;
-      if (part.type !== "tool_use") continue;
-      turn.tools.push(shortTool(part.name));
-      turn.details.push({ name: shortTool(part.name), detail: toolDetail(part.input) });
-    }
-  }
-  return out.filter((m) => m.role === "user" || m.text || m.tools.length);
+// botsagent gives messages as {id, role, text, tools: [{name, detail}], at: ms}; the rows want names and details apart.
+function toMessage(m) {
+  const calls = m.tools ?? [];
+  return { ...m, at: m.at ? new Date(m.at) : null, tools: calls.map((c) => c.name), details: calls };
 }
 
 export default class BotChat extends View {
@@ -82,7 +41,7 @@ export default class BotChat extends View {
     const bot = props()?.bot ?? "";
     this.bot = /^[a-z0-9][a-z0-9-]{0,23}$/.test(bot) ? bot : "";
     this.term = `bot-${this.bot}`;
-    this.dir = projectDir(`${home()}/.herdr-bots/${this.bot}`);
+    this.dir = null;           // the agent's session folder, from the first read
     this.messages = [];
     // My messages that were sent but are not in the transcript yet; dropped once they appear.
     this.pending = [];
@@ -92,7 +51,8 @@ export default class BotChat extends View {
     this.showSessions = false;
     this.doing = "";
     this.showModel = false;
-    this.config = null;          // model and effort stored in the database
+    this.config = null;          // agent, model and effort stored in the database
+    this.providers = [];         // agents with their models and efforts (botsagent providers)
     this.pendingRestart = false; // restart after the current turn to apply a model change
     this.copied = null;
     this.scrollTo = null;
@@ -101,16 +61,18 @@ export default class BotChat extends View {
     this.mtime = "";
     this.error = "";
     this.asking = "";
-    this.model = "";
     this.openTools = new Set();
     this.scroll = ScrollHandle.new();
     this.input = TextareaState.new({ placeholder: tr(`${this.bot} 에게 메시지 보내기 (Shift+Enter 줄바꿈)`, `Message ${this.bot} (Shift+Enter for a new line)`) });
     this.input.set_auto_grow(2, 8);
     this.input.on("submit", (e, cx) => { if (!e.shift) this.send(cx); });
     if (checking()) return;
-    cx.spawn(async (cx) => { await this.load(); this.scrollTo = "end"; await this.facts(); cx.notify(); });
-    // Read as soon as the transcript folder changes. Before the first chat (no folder yet) or if watching stops, the 2 s check below covers it.
+    // Read as soon as the session folder changes. Before the first chat (no folder yet) or if watching stops, the 2 s check below covers it.
     cx.spawn(async (cx) => {
+      await this.load();
+      this.scrollTo = "end";
+      await this.facts();
+      cx.notify();
       for (;;) {
         const changed = await watchFolder(this.dir).catch(() => null);
         if (changed === null) return;
@@ -147,22 +109,19 @@ export default class BotChat extends View {
 
   async load() {
     this.loadedAt = Date.now();
-    // The current conversation (no view) is the newest 1:1 session, room sessions excluded.
-    if (!this.view && (!this.chatSessionAt || Date.now() - this.chatSessionAt > 5000)) {
-      const found = await exec(BOTSDB(home()), ["chat-session", this.bot]);
-      this.chatSession = found.code === 0 ? JSON.parse(found.stdout).id : null;
-      this.chatSessionAt = Date.now();
-    }
-    const r = await exec("/bin/sh", ["-c", READ, "_", this.dir, this.view ?? this.chatSession ?? ""]);
-    const [stamp, ...lines] = r.stdout.split("\n");
-    const born = Number(stamp?.split(" ")[1] ?? 0) * 1000;
+    // The current conversation (no view) is the 1:1 session, room sessions excluded; botsagent picks it.
+    const r = await exec(BOTSAGENT(home()), ["transcript", this.bot, this.view ?? ""]);
+    if (r.code !== 0) return false;
+    const read = JSON.parse(r.stdout);
+    this.dir = read.dir;
+    const { stamp, born } = read;
     // After New chat, stay empty until a newer transcript shows up.
     const waitingNew = this.clearedAt && born < this.clearedAt - 2000;
     const key = waitingNew ? "new" : `${this.view}:${stamp}`;
     if (!stamp || key === this.mtime) return false;
     this.mtime = key;
     if (!waitingNew) this.clearedAt = 0;
-    const parsed = waitingNew ? [] : parse(lines);
+    const parsed = waitingNew ? [] : read.messages.map(toMessage);
     // Reuse unchanged message objects so their Markdown is not redrawn.
     const before = new Map(this.messages.map((m) => [m.id, m]));
     const same = (a, b) => a && a.text === b.text && (a.tools?.length ?? 0) === (b.tools?.length ?? 0);
@@ -183,20 +142,41 @@ export default class BotChat extends View {
     const facts = JSON.parse(r.stdout);
     this.asking = facts.status?.state === "blocked" ? facts.status?.msg ?? "" : "";
     this.doing = facts.status?.state === "working" ? facts.status?.msg ?? "" : "";
-    const argv = facts.foreground?.argv ?? facts.argv ?? [];
-    const at = argv.indexOf("--model");
-    this.model = at >= 0 ? argv[at + 1].replace(/^claude-/, "").replace(/-(\d)-(\d)$/, " $1.$2").replace(/^./, (c) => c.toUpperCase()) : this.model;
   }
 
   async loadConfig() {
     const r = await exec(BOTSDB(home()), ["bot-config", this.bot]);
     if (r.code === 0) this.config = JSON.parse(r.stdout);
+    if (!this.providers.length) {
+      const p = await exec(BOTSAGENT(home()), ["providers"]);
+      if (p.code === 0) this.providers = JSON.parse(p.stdout);
+    }
+  }
+
+  provider() {
+    return this.providers.find((p) => p.id === this.config?.provider) ?? null;
+  }
+
+  // The model chip: the model's label from the agent's list, else its id.
+  modelLabel() {
+    const model = this.config?.model;
+    return Object.fromEntries(this.provider()?.models ?? [])[model] ?? model ?? "";
+  }
+
+  // Switching the agent takes its default model and effort and starts a new conversation in that agent.
+  async chooseProvider(id, cx) {
+    const r = await exec(BOTSAGENT(home()), ["use", this.bot, id]);
+    if (r.code !== 0) return;
+    this.config = JSON.parse(r.stdout);
+    this.pendingRestart = true;
+    cx.notify();
+    if (this.status() !== "working") await this.applyModel(cx);
   }
 
   // Choosing a model or effort saves it to the database and restarts the bot (continuing the last conversation); while working, after the turn.
   async chooseModel(model, effort, cx) {
     await exec(BOTSDB(home()), ["set-model", this.bot, model, effort]);
-    this.config = { model, effort };
+    this.config = { ...this.config, model, effort };
     this.pendingRestart = true;
     cx.notify();
     if (this.status() !== "working") await this.applyModel(cx);
@@ -216,17 +196,22 @@ export default class BotChat extends View {
 
   modelPanel(t, keep) {
     const current = this.config ?? {};
+    const provider = this.provider();
+    const installed = this.providers.filter((p) => p.installed);
     const option = (id, label, on, onClick) => div().id(id).px(10).py(3).rounded(999).text_size(12).cursor_pointer()
       .border_1().border_color(on ? t.accent : t.border).text_color(on ? t.foreground : t.muted).when(on, (el) => el.bg(t.selected))
       .hover((s) => s.bg(t.hover)).on_click(onClick).child(label);
     const note = this.restarting ? tr("다시 띄우는 중…", "Restarting…") : this.pendingRestart ? tr("작업이 끝나면 다시 띄워 적용합니다", "Applies after this turn") : tr("고르면 봇을 다시 띄워 적용합니다(대화는 이어집니다)", "Picking restarts the bot (the conversation continues)");
     return v_flex().flex_none().px(22).py(10).gap(8).border_b_1().border_color(t.border).on_mouse_down("left", keep)
+      .when(installed.length > 1, (el) => el.child(h_flex().gap(6).flex_wrap().items_center()
+        .child(div().w(52).text_size(12).text_color(t.dim).child(tr("에이전트", "Agent")))
+        .children(installed.map((p) => option(`provider-${p.id}`, p.label, current.provider === p.id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseProvider(p.id, cx); }))))))
       .child(h_flex().gap(6).flex_wrap().items_center()
         .child(div().w(52).text_size(12).text_color(t.dim).child(tr("모델", "Model")))
-        .children(MODELS.map(([id, label]) => option(`model-${id}`, label, current.model === id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(id, current.effort ?? "low", cx); })))))
-      .child(h_flex().gap(6).items_center()
+        .children((provider?.models ?? []).map(([id, label]) => option(`model-${id}`, label, current.model === id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(id, current.effort ?? provider.default_effort, cx); })))))
+      .child(h_flex().gap(6).flex_wrap().items_center()
         .child(div().w(52).text_size(12).text_color(t.dim).child("effort"))
-        .children(EFFORTS.map((e) => option(`effort-${e}`, e, current.effort === e, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(current.model ?? "claude-sonnet-5-5", e, cx); })))))
+        .children((provider?.efforts ?? []).map((e) => option(`effort-${e}`, e, current.effort === e, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(current.model ?? provider.default_model, e, cx); })))))
       .child(div().text_size(11.5).text_color(this.pendingRestart || this.restarting ? t.working : t.dim).child(note));
   }
 
@@ -274,9 +259,9 @@ export default class BotChat extends View {
     openOverlay({ kind: "window", mod: "bot-chat", key: `chat-${this.bot}`, keep: true, width: minimized ? 320 : 520, height: minimized ? 52 : 680, props: { bot: this.bot, minimized } });
   }
 
-  // The session list comes from the local database index (botsdb sessions); botsdb rescans only transcripts that changed.
+  // The session list comes from botsagent, which keeps titles in the local database and rereads only sessions that changed.
   async loadSessions() {
-    const r = await exec(`${home()}/.herdr-bots/bin/botsdb`, ["sessions", this.bot]);
+    const r = await exec(BOTSAGENT(home()), ["sessions", this.bot]);
     const list = r.code === 0 ? JSON.parse(r.stdout) : [];
     this.sessions = list.map((x) => ({ ...x, at: new Date(x.at * 1000) }));
   }
@@ -291,17 +276,16 @@ export default class BotChat extends View {
     cx.notify();
   }
 
-  // New chat: send /clear to the bot to start a fresh session.
+  // New chat: send the agent's new-session command (/clear in Claude Code, /new in Codex).
   newChat(cx) {
     this.view = null;
     this.showSessions = false;
-    this.chatSessionAt = 0;
     this.clearedAt = Date.now();
     this.messages = [];
     this.pending = [];
     this.mtime = "";
     this.fastUntil = Date.now() + 60_000;
-    cx.spawn(async () => { await hc(["send", this.term, "/clear"]); });
+    cx.spawn(async () => { await hc(["send", this.term, this.provider()?.new_chat ?? "/clear"]); });
     cx.notify();
   }
 
@@ -464,7 +448,7 @@ export default class BotChat extends View {
         .child(div().min_w(0).truncate().font_semibold().text_color(t.foreground).child(this.title()))
         .when(!minimized, (el) => el.child(div().id("model-chip").cursor_pointer().on_mouse_down("left", keep)
           .on_click((_e, cx) => { this.showModel = !this.showModel; cx.notify(); })
-          .child(chip(`${this.model || tr("모델", "Model")} ▾`))))
+          .child(chip(`${this.modelLabel() || tr("모델", "Model")} ▾`))))
         .child(div().flex_1())
         .when(!minimized, (el) => el.child(div().id("sessions").cursor_pointer().on_mouse_down("left", keep)
           .on_click((_e, cx) => {

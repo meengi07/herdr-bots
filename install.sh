@@ -14,7 +14,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)" >&2; missi
 missing=0
 need herdr-app "the Herdr desktop app, https://herdr.dev"
 need hc "herdr-core; installed with the Herdr app"
-need claude "Claude Code CLI"
+command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || { echo "missing: an agent CLI (claude or codex)" >&2; missing=1; }
 need /usr/bin/python3 "macOS command line tools"
 [ "$missing" = 0 ] || exit 1
 command -v alerter >/dev/null 2>&1 || echo "note: alerter not found, so desktop notifications are skipped (in-app toasts still work). https://github.com/vjeantet/alerter"
@@ -44,8 +44,8 @@ for mod in "$repo"/mods/*/; do
 done
 place "$repo/layouts/bots.json" "$app_home/layouts/bots.json"
 
-cp "$repo/runtime/bin/herdr-bot" "$repo/runtime/bin/botsdb" "$repo/runtime/bin/botsmem" "$bots_home/bin/"
-chmod +x "$bots_home/bin/herdr-bot" "$bots_home/bin/botsdb" "$bots_home/bin/botsmem"
+cp "$repo/runtime/bin/herdr-bot" "$repo/runtime/bin/botsdb" "$repo/runtime/bin/botsmem" "$repo/runtime/bin/botsagent" "$bots_home/bin/"
+chmod +x "$bots_home/bin/herdr-bot" "$bots_home/bin/botsdb" "$bots_home/bin/botsmem" "$bots_home/bin/botsagent"
 [ -e "$bots_home/RULES.md" ] || cp "$repo/runtime/RULES.md" "$bots_home/RULES.md"
 "$bots_home/bin/botsdb" migrate >/dev/null
 # Install the hooks (SOUL/MEMORY change notes, reflection) for existing bots too; they apply from the next start.
@@ -62,7 +62,7 @@ cat <<EOF
 
 Next:
   herdr-app do layout.switch '{"name":"bots"}'        # show the Bots sidebar (ctrl-shift-l switches back)
-  $bots_home/bin/herdr-bot new mybot                    # make a bot, then edit $bots_home/mybot/SOUL.md
+  $bots_home/bin/herdr-bot new mybot [codex]            # make a bot (Claude Code unless you name codex), then edit $bots_home/mybot/SOUL.md
   $bots_home/bin/herdr-bot schedule mybot 10:00 weekdays "Summarize what needs me today."
-The first start of a bot asks Claude Code to trust its folder: open its chat window and answer in the terminal.
+The first start of a bot asks the agent to trust its folder: open its chat window and answer in the terminal.
 EOF

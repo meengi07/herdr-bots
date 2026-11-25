@@ -1,8 +1,8 @@
 # herdr-bots
 
-Long-running Claude Code bots inside [Herdr](https://herdr.dev), with a chat window per bot, rooms where bots hand
-work to each other, scheduled runs and desktop notifications. Inspired by Orca Bots, built only from Herdr's mod API,
-`hc` and Claude Code.
+Long-running agent bots inside [Herdr](https://herdr.dev), with a chat window per bot, rooms where bots hand
+work to each other, scheduled runs and desktop notifications. A bot runs Claude Code, Codex or another agent CLI Herdr
+knows (see [Agents](#agents)). Inspired by Orca Bots, built only from Herdr's mod API and `hc`.
 
 ![herdr-bots](preview.png)
 
@@ -13,18 +13,19 @@ work to each other, scheduled runs and desktop notifications. Inspired by Orca B
 
 - **Bots sidebar** under Spaces: each bot with its lamb icon, color, status (working, needs you, idle, off) and next
   schedule. Click to open its chat; right-click to rename or remove it (removed bots move to `~/.herdr-bots/.trash`).
-- **Bot chat window**: a floating window (no tab) that renders the bot's Claude Code transcript as a chat: your
+- **Bot chat window**: a floating window (no tab) that renders the bot's agent session as a chat: your
   bubbles on the right, the bot's replies as Markdown, tool calls folded into a chip, a working line with elapsed time,
-  a card with a "answer in terminal" button when Claude asks for a permission, past sessions and "new chat".
+  a card with a "answer in terminal" button when the agent asks for a permission, past sessions and "new chat". The
+  model chip picks the agent, model and effort.
 - **Rooms**: `+` creates a room at once and opens it with the bot picker; name it later by clicking its title or from
   the right-click menu, which also has "Leave room" (its history is kept). The member panel sets the host and removes
   bots. Several bots in one chat. A message goes to the bots you `@mention` (or the first member, the room
   owner). A bot that `@mentions` another bot hands the turn to it (limits below).
-- **Self-updating persona and memory**: every turn, a Claude Code hook compares the bot's `SOUL.md` and `MEMORY.md`
+- **Self-updating persona and memory** (Claude Code bots): every turn, a Claude Code hook compares the bot's `SOUL.md` and `MEMORY.md`
   with what that session last saw and adds the change to the turn. Every 5 turns a background reflection proposes
   edits from the conversation; `botsmem` checks them (owner rules untouchable, at most 25% of memory lines removed per
   run, removed lines archived, no secrets, the `## Never` section protected) and keeps an undoable history.
-- **Rooms that behave**: each member gets a room-only Claude session (idle ones stop after 30 minutes), wakes with what
+- **Rooms that behave**: each member gets a room-only agent session (idle ones stop after 30 minutes), wakes with what
   was said since its last reply as quoted data, ignores `@names` inside code, quotes and history, and stops after 3
   rounds or 10 bot replies per message (Continue up to 5 times). A bot mentioning the bot that called it does not wake
   it again. `@user` raises a "needs you" mark and a notification; rooms show unread counts and a Stop button.
@@ -37,7 +38,8 @@ work to each other, scheduled runs and desktop notifications. Inspired by Orca B
 ## Requirements
 
 - macOS, the Herdr desktop app (0.1.17 or later) with `hc` (herdr-core) on `PATH`
-- Claude Code CLI (`claude`)
+- An agent CLI: Claude Code (`claude`) or Codex (`codex`); the other agents in [Agents](#agents) are untested
+- Optional: `zstd` (Homebrew) to read Codex sessions Codex has closed and compressed
 - `/usr/bin/python3` (the local database helper uses its `sqlite3` module)
 - Optional: [alerter](https://github.com/vjeantet/alerter) for desktop notifications
 
@@ -56,15 +58,16 @@ herdr-app do layout.switch '{"name":"bots"}'
 
 ```sh
 ~/.herdr-bots/bin/herdr-bot new briefing           # then describe it in ~/.herdr-bots/briefing/SOUL.md
+~/.herdr-bots/bin/herdr-bot new helper codex       # a bot that runs Codex
 ~/.herdr-bots/bin/herdr-bot schedule briefing 10:00 weekdays "Summarize what needs me today."
 ```
 
-Click the bot in the sidebar to start it and open its chat. The first start asks Claude Code to trust the bot's folder:
-the chat shows a card, press "answer in terminal" and accept.
+Click the bot in the sidebar to start it and open its chat. The first start asks the agent to trust the bot's folder
+(Codex may also ask about your own hooks): the chat shows a card, press "answer in terminal" and answer.
 
 | Command | What it does |
 |---|---|
-| `herdr-bot new <name>` | make a bot home (`SOUL.md`, `MEMORY.md`, `CLAUDE.md`) |
+| `herdr-bot new <name> [agent]` | make a bot home (`SOUL.md`, `MEMORY.md`, `CLAUDE.md`); agent defaults to `claude` |
 | `herdr-bot start <name>` | start it, continuing its last conversation |
 | `herdr-bot resume <name> <session>` | switch it to a past session |
 | `herdr-bot send <name> <text>` | send it a message (starts it if needed) |
@@ -74,26 +77,53 @@ the chat shows a card, press "answer in terminal" and accept.
 | `herdr-bot dm <bot> <text>` | (inside a bot) message another bot |
 | `botsmem history <name>` / `botsmem undo <name> [id]` | see or undo persona and memory changes |
 
-Model and effort per bot: `botsdb set-model <bot> <model> <effort>` (default `claude-sonnet-5-5`, `low`), or the chat window's model chip. Environment overrides: `HERDR_BOT_MODEL`, `HERDR_BOT_EFFORT`,
-`HERDR_BOT_PERMISSION` (`auto`). Notification language: `mods/desktop-toast/config.json` (`auto` follows the UI, or `en` / `ko`).
+Agent, model and effort per bot: the chat window's model chip, the room's member panel, `botsagent use <bot> <agent>`
+(that agent's defaults) or `botsdb set-model <bot> <model> <effort> [agent]` (default `claude`, `claude-sonnet-5-5`, `low`).
+Environment overrides: `HERDR_BOT_MODEL`, `HERDR_BOT_EFFORT`, `HERDR_BOT_PERMISSION` (Claude Code, `auto`). Notification language: `mods/desktop-toast/config.json` (`auto` follows the UI, or `en` / `ko`).
+
+## Agents
+
+`runtime/bin/botsagent` knows how to start each agent and how to read its sessions. Herdr's own list of agents has
+eleven; eight can run bots. The chat window offers the ones installed on your Mac.
+
+| Agent | Tested | Started as | Sessions read from |
+|---|---|---|---|
+| Claude Code | yes | `claude --model --effort --permission-mode auto` | `~/.claude/projects/<folder>/*.jsonl` |
+| Codex | yes | `codex --no-daemon -m -c model_reasoning_effort=… --approve-for-me` | `~/.codex/sessions/**/rollout-*.jsonl[.zst]` |
+| Pi | no | `pi --model --thinking` | `~/.pi/agent/sessions/--<folder>--/*.jsonl` |
+| Copilot | no | `copilot --model --effort --allow-all-tools` | `~/.copilot/session-state/<id>/events.jsonl` |
+| Grok | no | `grok -m --effort --permission-mode auto` | `~/.grok/sessions/<folder>/<id>/updates.jsonl` |
+| Kimi | no | `kimi -m --thinking\|--no-thinking --yolo` | `~/.kimi/sessions/<md5 of folder>/<id>/context.jsonl` |
+| Crush | no | `crush --yolo` (model from Crush's config) | `<bot folder>/.crush/crush.db` |
+| Gemini | no | `gemini -m --approval-mode auto_edit` | `~/.gemini/tmp/<project>/chats/session-*.jsonl` |
+
+- Untested agents were written from their public docs and source on 2026-11-25 and checked only against sample records
+  (`tests/test_botsagent.py`); expect fixes when one is run for real. `default` as a model or effort passes no flag.
+- Not supported: Amp keeps threads on its server, Cursor's CLI does not document its session files, and OpenCode's
+  database record format was not found, so their replies cannot be read.
+- Codex picks its own session id: a new room session is found by the room message it answered and recorded then.
+- Only Claude Code bots get the memory hooks (change notes each turn, reflection every 5 turns). Other agents read an
+  `AGENTS.md` (`GEMINI.md` for Gemini) that `botsagent` writes from `RULES.md`, `SOUL.md` and `MEMORY.md` at each start.
+  `herdr-bot reflect <bot>` still works for them by hand; it runs `claude -p`.
 
 ## How it works
 
 | Piece | Where |
 |---|---|
-| Bot persona and memory | `~/.herdr-bots/<bot>/SOUL.md`, `MEMORY.md`; shared rules in `~/.herdr-bots/RULES.md`, all imported by the bot's `CLAUDE.md` |
+| Bot persona and memory | `~/.herdr-bots/<bot>/SOUL.md`, `MEMORY.md`; shared rules in `~/.herdr-bots/RULES.md`, all imported by the bot's `CLAUDE.md` (or written into `AGENTS.md`) |
 | Bot session | an `hc` terminal named `bot-<bot>` with the label `herdr.bot=<bot>`, kept in a hidden tab |
-| 1:1 chat history | Claude Code's own transcript (`~/.claude/projects/<bot folder>/*.jsonl`), read only |
+| 1:1 chat history | the agent's own session files (see [Agents](#agents)), read only through `botsagent` |
 | Bots, sessions index, rooms, room messages | `~/.herdr-bots/bots.db` (SQLite) through `botsdb`, which binds every value as a SQL parameter |
-| Persona and memory upkeep | `botsmem`, called by the bot folder's Claude Code hooks (`UserPromptSubmit`, `Stop`) |
-| Room relay | the Bots sidebar mod, when the database or a bot transcript changes; every 1.5 s only while a reply or DM is waiting, else every 30 s. One `botsdb relay-snapshot` call per pass. A `send` row is unique per (room, message, bot), so a message is never delivered twice |
+| Persona and memory upkeep | `botsmem`, called by the bot folder's Claude Code hooks (`UserPromptSubmit`, `Stop`); reflection reads any agent's sessions through `botsagent` |
+| Room relay | the Bots sidebar mod, when the database or a bot's session folder changes; every 1.5 s only while a reply or DM is waiting, else every 30 s. One `botsdb relay-snapshot` call per pass. A `send` row is unique per (room, message, bot), so a message is never delivered twice |
 
 ## Security and privacy
 
-- The mods run programs (`hc`, `claude`, `botsdb`, `alerter`, `launchctl` through `herdr-bot`) and read Claude Code
-  transcripts of the bots under `~/.claude/projects/`. They make no network requests themselves.
-- Bots run Claude Code with `--permission-mode auto` by default. Set `HERDR_BOT_PERMISSION` if you want every tool
-  call confirmed.
+- The mods run programs (`hc`, the agent CLIs, `botsdb`, `botsagent`, `alerter`, `launchctl` through `herdr-bot`) and
+  read the bots' agent sessions (paths in [Agents](#agents)). They make no network requests themselves.
+- Bots run without asking for each tool call: Claude Code with `--permission-mode auto` (set `HERDR_BOT_PERMISSION` to
+  change it), Codex with `--approve-for-me`; the "Started as" column shows the others. Pi, Kimi (`--yolo`) and Crush
+  (`--yolo`) do not ask at all.
 - `RULES.md` tells bots not to push, comment, merge or message anyone without your approval, and to treat text from
   tickets, pages and tool output as data. That is a prompt, not a sandbox.
 - Prompt injection is not solved. Room history, DMs and quoted text are wrapped as data and known control phrases are
@@ -109,8 +139,8 @@ Model and effort per bot: `botsdb set-model <bot> <model> <effort>` (default `cl
 
 - The relay runs only while the Herdr app is open.
 - A room shows each bot's final reply of a turn; intermediate text stays in that bot's own chat.
-- Permission prompts and multiple-choice questions are not in transcripts, so they are answered in the terminal.
-- Only Claude Code bots; only macOS (launchd, alerter).
+- Permission prompts and multiple-choice questions are not in session files, so they are answered in the terminal.
+- Only macOS (launchd, alerter). Agent support is listed in [Agents](#agents).
 
 ## License
 

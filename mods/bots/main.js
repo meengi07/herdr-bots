@@ -15,9 +15,9 @@ const ROOT_MESSAGES = 10;  // most bot replies per human message; then pause, an
 const CONTINUES = 5;
 const ROOM_IDLE_MIN = 30;  // room sessions idle this long are stopped (the conversation stays and is resumed next time)
 const CONTEXT_CHARS = 24_000; // most characters of room history handed to a bot when it wakes (same as Orca BOT_GROUP_CONTEXT_MAX)
-const projectDir = (cwd) => `${home()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
 const newId = () => `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const BOTSDB = () => `${home()}/.herdr-bots/bin/botsdb`;
+const BOTSAGENT = () => `${home()}/.herdr-bots/bin/botsagent`;
 const pad2 = (n) => String(n).padStart(2, "0");
 
 // A send without its done mark: that bot's reply has not been posted yet.
@@ -85,29 +85,11 @@ export const statusOf = (bot, room) => {
 };
 const botStatus = (bot) => statusOf(bot, null);
 
-// In that session's transcript, find the last reply after the user line carrying marker (room message id or DM id). null while still working.
-async function replyIn(file, marker) {
-  const r = await exec("/bin/sh", ["-c", '[ -f "$1" ] && tail -n 600 "$1"; true', "_", file]);
-  const lines = r.stdout.split("\n").map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
-  const start = lines.findIndex((d) => d.type === "user" && typeof d.message?.content === "string" && d.message.content.includes(marker));
-  if (start < 0) return null;
-  const texts = [];
-  let answered = false;
-  for (const d of lines.slice(start + 1)) {
-    if (d.type === "user" && typeof d.message?.content === "string") break;
-    if (d.type !== "assistant" || !Array.isArray(d.message?.content)) continue;
-    answered = true;
-    for (const part of d.message.content) if (part.type === "text" && part.text.trim()) texts.push(part.text.trim());
-  }
-  if (!answered) return null;
-  const text = texts.at(-1) ?? "";
-  if (!text || /^(조용|quiet)[.!。]?$/i.test(text)) return { silent: true };
-  return { text };
-}
-
-// The 1:1 transcript file (room sessions excluded).
-async function newestTranscript(bot) {
-  return (await botsdb("chat-session", bot)).file ?? "";
+// The reply to the message carrying marker (room message id or DM id), read from the bot's agent session by botsagent:
+// null while there is none, {silent} for "quiet", else {text}. room "-" and session "-" mean the 1:1 session.
+async function replyIn(bot, room, session, marker) {
+  const r = await exec(BOTSAGENT(), ["reply", bot, room ?? "-", session ?? "-", marker]);
+  return r.code === 0 ? JSON.parse(r.stdout) : null;
 }
 
 // UI text follows the system language: Korean when Korean comes first, English otherwise. This mod reads the macOS setting into shared("bots.lang").
@@ -204,8 +186,9 @@ export default class Bots extends View {
     setShared("bots.lang", await detectLanguage());
     const bots = await botsdb("bots");
     this.bots = bots.map((b) => b.id);
-    // A bot's replies land in its Claude transcript folder; watch new bots' folders too.
-    if (cx) for (const id of this.bots) this.watch(cx, projectDir(`${home()}/.herdr-bots/${id}`));
+    // A bot's replies land in its agent's session folder (botsagent knows which); watch new bots' folders too.
+    const dirs = await exec(BOTSAGENT(), ["watch-dirs"]);
+    if (cx && dirs.code === 0) for (const dir of JSON.parse(dirs.stdout)) this.watch(cx, dir);
     for (const name of this.bots) {
       const plist = `${home()}/Library/LaunchAgents/dev.herdr-bots.${name}.plist`;
       const r = await exec("/usr/bin/plutil", ["-extract", "StartCalendarInterval", "json", "-o", "-", plist]);
@@ -308,8 +291,7 @@ export default class Bots extends View {
     for (const [key, event] of sent) {
       if (done.has(key) || !sessions[event.bot]) continue;
       if (statusOf(event.bot, room) === "working") continue;
-      const file = `${projectDir(`${home()}/.herdr-bots/${event.bot}`)}/${sessions[event.bot]}.jsonl`;
-      const reply = await replyIn(file, event.id);
+      const reply = await replyIn(event.bot, room, sessions[event.bot], event.id);
       if (!reply) continue;
       if (reply.silent) { await appendRoom(room, { t: "done", id: event.id, bot: event.bot, silent: true }); continue; }
       const id = newId();
@@ -352,7 +334,13 @@ export default class Bots extends View {
       terminal = started.stdout.trim().split("\n").at(-1);
     }
     await botsdb("room-touch", room, bot);
-    await hc(["send", terminal, text]);
+    // A session that just started can still show a dialog (folder trust, hooks), and hc refuses to type into it.
+    // The send row is already claimed, so a refusal here would lose the message: retry for about a minute.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if ((await hc(["send", terminal, text])).code === 0) return;
+      await exec("/bin/sleep", ["3"]);
+    }
+    console.error("bots deliver: could not type into", terminal);
   }
 
   // DMs between bots: deliver pending ones to the receiver's 1:1 session and mark the reply (botsdb creates a reply DM when one is expected).
@@ -372,7 +360,7 @@ export default class Bots extends View {
     }
     for (const dm of dms.sent) {
       if (botStatus(dm.to_bot) === "working") continue;
-      const reply = await replyIn(await newestTranscript(dm.to_bot), dm.id);
+      const reply = await replyIn(dm.to_bot, null, null, dm.id);
       if (!reply) continue;
       await botsdb("dm-mark", dm.id, "done", reply.silent ? "" : reply.text);
     }

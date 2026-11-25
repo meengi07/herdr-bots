@@ -6,9 +6,8 @@ Values are always bound as SQL parameters (user text is never read as SQL). Outp
   botsdb bots                         bots [{id,title,color}]
   botsdb bot-add <id>                 add a bot row (no-op if it exists)
   botsdb set-title <id> <title>       display name (an empty string goes back to the id)
-  botsdb bot-config <id>              {model, effort} (defaults when unset)
-  botsdb set-model <id> <model> <effort>   the bot's model and effort (from its next start)
-  botsdb sessions <id>                the bot's Claude sessions (latest 30; refreshes the index from transcripts)
+  botsdb bot-config <id>              {provider, model, effort} (defaults when unset)
+  botsdb set-model <id> <model> <effort> [provider]   the bot's agent, model and effort (from its next start)
   botsdb rooms                        rooms [{id,title,members,last}]
   botsdb room-create [title]          create a room (the title may be empty) -> {"id"}
   botsdb room-rename <room> <title>   rename a room
@@ -19,9 +18,8 @@ Values are always bound as SQL parameters (user text is never read as SQL). Outp
   botsdb room-add <room> <bot>        add a bot to a room (the first one is the host)
   botsdb room-read <room> [after]     room info + events with seq > after
   botsdb room-append <room> <json>... add events. send/done are unique per (room, kind, message id, bot); a repeat is ignored -> {"inserted":[true|false,...]}
-  botsdb room-members <room>          members and their room-only Claude session ids [{bot, session}] (created when missing)
+  botsdb room-members <room>          members and their room-only session ids [{bot, session}] (created when missing)
   botsdb relay-snapshot               what one relay pass needs: {rooms:[room + {meta, events, sessions}], dms:{queued, sent}}
-  botsdb chat-session <bot>           the bot's 1:1 session id (newest transcript, room sessions excluded) -> {"id"} | {"id": null}
   botsdb room-touch <room> <bot>      set that member's last room-session activity to now
   botsdb room-idle <minutes>          room sessions idle longer than that [{room, bot, session}]
   botsdb room-mark-read <room> <seq>  mark the room read up to that event
@@ -32,6 +30,7 @@ Values are always bound as SQL parameters (user text is never read as SQL). Outp
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -39,8 +38,11 @@ import time
 HOME = os.path.expanduser("~/.herdr-bots")
 # Bots are conversational, so latency matters. Measured 2026-11-25 (short answer, warm cache, API time):
 # Opus 5.5·medium 3.5~7.8s, Opus·low 2.1~2.4s, Sonnet 5.5·low 0.8s, Haiku 5.5·low 0.85s.
+DEFAULT_PROVIDER = "claude"
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_EFFORT = "low"
+# Agents botsagent can start (herdr-bot exec). Sessions, transcripts and model lists live in botsagent.
+PROVIDERS = ("claude", "codex", "pi", "copilot", "grok", "kimi", "crush", "gemini")
 DB = os.path.join(HOME, "bots.db")
 DM_MAX_HOPS = 4          # same as Hermes bot_loop_guard.max_hops
 DM_MAX_CHARS = 16_000
@@ -96,7 +98,7 @@ def connect():
     db.execute("pragma journal_mode=wal")
     db.executescript(SCHEMA)
     # Columns added later: skip when they already exist.
-    for table, column, kind in (("bots", "model", "text"), ("bots", "effort", "text"),
+    for table, column, kind in (("bots", "model", "text"), ("bots", "effort", "text"), ("bots", "provider", "text"),
                                 ("room_events", "root", "text"), ("room_events", "needs", "integer"),
                                 ("room_members", "session_id", "text"), ("room_members", "last_active", "real"),
                                 ("rooms", "last_read_seq", "integer"), ("rooms", "archived", "integer")):
@@ -130,75 +132,11 @@ def bots(db):
         db.execute("insert or ignore into bots (id, created_at) values (?, ?)", (bot, now()))
     db.commit()
     ids = bot_ids()
-    rows = {r["id"]: r for r in db.execute("select id, title, model, effort from bots")}
+    rows = {r["id"]: r for r in db.execute("select id, title, model, effort, provider from bots")}
     return [{"id": b, "title": (rows[b]["title"] or b) if b in rows else b, "color": OKABE[i % len(OKABE)],
+             "provider": (rows[b]["provider"] if b in rows else None) or DEFAULT_PROVIDER,
              "model": (rows[b]["model"] if b in rows else None) or DEFAULT_MODEL,
              "effort": (rows[b]["effort"] if b in rows else None) or DEFAULT_EFFORT} for i, b in enumerate(ids)]
-
-
-def transcripts_dir(bot):
-    cwd = os.path.join(HOME, bot)
-    return os.path.expanduser("~/.claude/projects/" + "".join(c if c.isalnum() else "-" for c in cwd))
-
-
-def session_title(path, bot):
-    title, first = "", ""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if '"type":"custom-title"' in line:
-                try:
-                    found = json.loads(line).get("customTitle") or ""
-                except ValueError:
-                    continue
-                # Older herdr-bot started bots with -n bot-<bot>, which overwrote the session name; do not use that name as a title.
-                if found and found != "bot-" + bot:
-                    title = found
-            elif not first and '"type":"user"' in line:
-                try:
-                    content = json.loads(line).get("message", {}).get("content")
-                except ValueError:
-                    continue
-                if isinstance(content, str) and not content.strip().startswith("<command"):
-                    first = content
-    if title:
-        return title
-    import re
-    text = re.sub(r"<[^>]+>", "", first).strip()
-    return text[:40] or "(untitled)"
-
-
-def room_session_ids(db, bot):
-    return {r[0] for r in db.execute("select session_id from room_members where bot = ? and session_id is not null", (bot,))}
-
-
-def chat_files(db, bot):
-    """1:1 transcript files, newest first. Room sessions share the folder, so they are excluded."""
-    folder = transcripts_dir(bot)
-    if not os.path.isdir(folder):
-        return []
-    rooms = room_session_ids(db, bot)
-    files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".jsonl") and f[:-6] not in rooms]
-    return sorted(files, key=os.path.getmtime, reverse=True)
-
-
-def sessions(db, bot):
-    files = chat_files(db, bot)[:30]
-    known = {r["session_id"]: r for r in db.execute("select session_id, title, last_at from sessions where bot = ?", (bot,))}
-    result = []
-    for i, path in enumerate(files):
-        sid = os.path.basename(path)[:-6]
-        mtime = os.path.getmtime(path)
-        row = known.get(sid)
-        # Only reread titles of sessions whose transcript changed (do not scan large files every time).
-        if row is None or row["last_at"] != mtime:
-            title = session_title(path, bot)
-            db.execute("insert into sessions (bot, session_id, title, last_at) values (?, ?, ?, ?) "
-                       "on conflict (bot, session_id) do update set title = excluded.title, last_at = excluded.last_at", (bot, sid, title, mtime))
-        else:
-            title = row["title"]
-        result.append({"id": sid, "title": title, "at": mtime, "current": i == 0})
-    db.commit()
-    return result
 
 
 def members(db, room):
@@ -332,18 +270,21 @@ def main(argv):
         db.commit()
         out({"ok": True})
     elif cmd == "bot-config":
-        row = db.execute("select model, effort from bots where id = ?", (args[0],)).fetchone()
-        out({"model": (row and row["model"]) or DEFAULT_MODEL, "effort": (row and row["effort"]) or DEFAULT_EFFORT})
+        row = db.execute("select model, effort, provider from bots where id = ?", (args[0],)).fetchone()
+        out({"provider": (row and row["provider"]) or DEFAULT_PROVIDER, "model": (row and row["model"]) or DEFAULT_MODEL,
+             "effort": (row and row["effort"]) or DEFAULT_EFFORT})
     elif cmd == "set-model":
-        if args[2] not in ("low", "medium", "high", "xhigh", "max"):
-            print("effort must be low|medium|high|xhigh|max", file=sys.stderr)
+        provider = args[3] if len(args) > 3 else None
+        # The model and effort become agent arguments (Codex reads effort as TOML): allow plain names only.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}", args[1]) or not re.fullmatch(r"[a-z]{2,12}", args[2]) \
+                or (provider and provider not in PROVIDERS):
+            print(f"usage: set-model <bot> <model> <effort a-z> [{'|'.join(PROVIDERS)}]", file=sys.stderr)
             return 2
-        db.execute("insert into bots (id, model, effort, created_at) values (?, ?, ?, ?) "
-                   "on conflict (id) do update set model = excluded.model, effort = excluded.effort", (args[0], args[1], args[2], now()))
+        db.execute("insert into bots (id, model, effort, provider, created_at) values (?, ?, ?, ?, ?) "
+                   "on conflict (id) do update set model = excluded.model, effort = excluded.effort, "
+                   "provider = coalesce(excluded.provider, bots.provider)", (args[0], args[1], args[2], provider, now()))
         db.commit()
         out({"ok": True})
-    elif cmd == "sessions":
-        out(sessions(db, args[0]))
     elif cmd == "rooms":
         out(rooms(db))
     elif cmd == "room-create":
@@ -394,9 +335,6 @@ def main(argv):
         # One process per relay pass instead of 3 + 2 per room: starting python3 costs far more than these queries.
         out({"rooms": [{**room, **room_read(db, room["id"]), "sessions": room_members(db, room["id"])} for room in rooms(db)],
              "dms": {"queued": dm_list(db, "queued"), "sent": dm_list(db, "sent")}})
-    elif cmd == "chat-session":
-        files = chat_files(db, args[0])
-        out({"id": os.path.basename(files[0])[:-6] if files else None, "file": files[0] if files else None})
     elif cmd == "room-touch":
         db.execute("update room_members set last_active = ? where room = ? and bot = ?", (time.time(), args[0], args[1]))
         db.commit()

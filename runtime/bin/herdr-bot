@@ -1,5 +1,5 @@
 #!/bin/sh
-# herdr-bot new <name>            make a bot home (SOUL.md, MEMORY.md, CLAUDE.md)
+# herdr-bot new <name> [agent]    make a bot home (SOUL.md, MEMORY.md, CLAUDE.md); agent: claude (default) or codex
 # herdr-bot start <name>          start the bot session in a hidden Herdr tab (no-op if it runs)
 # herdr-bot remove <name>         remove a bot: stop its sessions and schedule, move its folder to ~/.herdr-bots/.trash
 # herdr-bot dm <to> <text>        (inside a bot) message another bot directly. At most 4 hops; the bot that woke you only gets a notification
@@ -12,7 +12,8 @@
 # herdr-bot schedule <name> <HH:MM> <weekdays|daily|0-6,...> <prompt>   send at a set time through launchd
 # herdr-bot unschedule <name>     remove the schedule
 #
-# Model and effort: botsdb set-model <bot> <model> <effort> (default claude-sonnet-5-5, low). HERDR_BOT_MODEL, HERDR_BOT_EFFORT and HERDR_BOT_PERMISSION win when set.
+# Agent, model and effort: botsdb set-model <bot> <model> <effort> [claude|codex] (default claude, claude-sonnet-5-5, low).
+# HERDR_BOT_MODEL, HERDR_BOT_EFFORT and HERDR_BOT_PERMISSION (Claude) win when set. botsagent knows how to start each agent.
 set -eu
 # launchd does not pass the login shell's PATH.
 export PATH="$HOME/.local/bin:$HOME/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"
@@ -43,6 +44,7 @@ if [ "$cmd" = new ]; then
   [ -e "$home" ] && { echo "already exists: $home" >&2; exit 1; }
   mkdir -p "$home"
   "$(dirname "$0")/botsdb" bot-add "$name" >/dev/null
+  [ -n "${3:-}" ] && "$(dirname "$0")/botsagent" use "$name" "$3" >/dev/null
   printf '# %s\n\nOne sentence: what this bot is for.\n\n## How I work\n\n- Where I look:\n- How I report:\n\n## Never\n\n- Do anything that leaves this machine without the owner'"'"'s approval.\n' "$name" > "$home/SOUL.md"
   printf '# MEMORY\n' > "$home/MEMORY.md"
   write_hooks "$home"
@@ -53,16 +55,7 @@ fi
 [ -f "$home/CLAUDE.md" ] || { echo "no bot home: $home" >&2; exit 1; }
 
 live() { hc get "${1:-$term}" --json 2>/dev/null | grep -q '"state":"live"'; }
-
-# Transcript folder: Claude Code names it after the cwd with every non-alphanumeric character turned into "-".
-transcripts="$HOME/.claude/projects/$(printf %s "$home" | sed 's/[^a-zA-Z0-9]/-/g')"
-
-# Model and effort are per bot in the database (botsdb set-model); environment variables win when set.
-load_model() {
-  config=$("$(dirname "$0")/botsdb" bot-config "$name")
-  model=${HERDR_BOT_MODEL:-$(printf %s "$config" | sed -n 's/.*"model": "\([^"]*\)".*/\1/p')}
-  effort=${HERDR_BOT_EFFORT:-$(printf %s "$config" | sed -n 's/.*"effort": "\([^"]*\)".*/\1/p')}
-}
+agent="$(dirname "$0")/botsagent"
 
 # Keep the tab so Herdr treats it as an agent (terminal.keep), but settle it out of the tab bar (tab.settle). You talk to bots in the chat window.
 # When the bot waits for input Herdr brings the tab back. terminal.park ends the bot, so it is not used.
@@ -77,36 +70,26 @@ keep_hidden() {
 # The bot process knows its own id as HERDR_BOT: herdr-bot dm reads the sender from it.
 start() {
   if ! live; then
-    # --continue can pick a room session (they share the folder): look up the 1:1 session in the database and --resume it.
-    last=$("$(dirname "$0")/botsdb" chat-session "$name" | sed -n 's/.*"id": "\([^"]*\)".*/\1/p')
-    if [ -n "${1:-}" ]; then resume="--resume $1"
-    elif [ -n "$last" ]; then resume="--resume $last"
-    else resume=""
-    fi
-    load_model
+    # botsagent continues the given session, else the 1:1 session (room sessions share the folder, so not "the last one").
     # --no-parent: the bot outlives the terminal that started it. --keep: when the program exits, keep a shell (no restart).
-    # $resume is unquoted on purpose (it must split into an option and its value).
     hc rm "$term" >/dev/null 2>&1 || true
     hc run --bg --keep --no-parent --name "$term" --label "herdr.bot=$name" --cwd "$home" \
-      env HERDR_BOT="$name" claude --model "$model" --effort "$effort" --permission-mode "${HERDR_BOT_PERMISSION:-auto}" $resume >/dev/null
+      env HERDR_BOT="$name" "$agent" exec "$name" "${1:-}" >/dev/null
     hc wait "$term" --timeout 60 >/dev/null 2>&1 || true
   fi
   keep_hidden "$term"
 }
 
-# Room-only sessions: one Claude session per room and member (kept apart from the 1:1 chat). Terminal names are limited to 32 characters, hence the hash.
+# Room-only sessions: one agent session per room and member (kept apart from the 1:1 chat). Terminal names are limited to 32 characters, hence the hash.
 room_term() { printf 'rb-%s' "$(printf %s "$1:$name" | shasum | cut -c1-12)"; }
 
 start_room() {
   room=$1 session=$2
   rterm=$(room_term "$room")
   if ! live "$rterm"; then
-    if [ -f "$transcripts/$session.jsonl" ]; then resume="--resume $session"; else resume="--session-id $session"; fi
-    load_model
     hc rm "$rterm" >/dev/null 2>&1 || true
     hc run --bg --keep --no-parent --name "$rterm" --label "herdr.bot=$name" --label "herdr.room=$room" --cwd "$home" \
-      env HERDR_BOT="$name" HERDR_ROOM="$room" claude --model "$model" --effort "$effort" \
-      --permission-mode "${HERDR_BOT_PERMISSION:-auto}" $resume >/dev/null
+      env HERDR_BOT="$name" HERDR_ROOM="$room" "$agent" exec "$name" "$session" "$room" >/dev/null
     hc wait "$rterm" --timeout 60 >/dev/null 2>&1 || true
   fi
   keep_hidden "$rterm"

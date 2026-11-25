@@ -14,8 +14,11 @@ async function botsdb(...args) {
   return JSON.parse(r.stdout);
 }
 const pad = (n) => String(n).padStart(2, "0");
-const MODELS = [["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"]];
-const EFFORTS = ["low", "medium", "high"];
+// Agents a bot can run as (Claude Code, Codex, …) with their models and efforts, from botsagent.
+async function providers() {
+  const r = await exec(`${home()}/.herdr-bots/bin/botsagent`, ["providers"]);
+  return r.code === 0 ? JSON.parse(r.stdout) : [];
+}
 const clock = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 // UI text follows the system language (the Bots mod puts it in shared("bots.lang")): Korean when Korean comes first, English otherwise.
 const tr = (ko, en) => (shared("bots.lang") === "ko" ? ko : en);
@@ -178,13 +181,24 @@ export default class BotRoom extends View {
 
   async loadConfigs() {
     const bots = await botsdb("bots");
-    this.configs = Object.fromEntries(bots.map((b) => [b.id, { model: b.model, effort: b.effort }]));
+    this.configs = Object.fromEntries(bots.map((b) => [b.id, { provider: b.provider, model: b.model, effort: b.effort }]));
+    if (!this.providers?.length) this.providers = await providers();
   }
 
   // Changing a member's model or effort saves it and restarts that bot (the conversation continues); while working, after the turn.
   async chooseModel(bot, model, effort, cx) {
     await botsdb("set-model", bot, model, effort);
-    this.configs[bot] = { model, effort };
+    this.configs[bot] = { ...this.configs[bot], model, effort };
+    this.pendingRestart.add(bot);
+    cx.notify();
+    if (botStatus(bot) !== "working") await this.applyModel(bot, cx);
+  }
+
+  // Switching the agent takes its default model and effort.
+  async chooseProvider(bot, provider, cx) {
+    const r = await exec(`${home()}/.herdr-bots/bin/botsagent`, ["use", bot, provider]);
+    if (r.code !== 0) return;
+    this.configs[bot] = JSON.parse(r.stdout);
     this.pendingRestart.add(bot);
     cx.notify();
     if (botStatus(bot) !== "working") await this.applyModel(bot, cx);
@@ -202,12 +216,14 @@ export default class BotRoom extends View {
   }
 
   membersPanel(t, keep) {
-    const label = Object.fromEntries(MODELS);
+    const installed = (this.providers ?? []).filter((p) => p.installed);
     const option = (id, text, on, onClick) => div().id(id).px(8).py(2).rounded(999).text_size(11.5).cursor_pointer()
       .border_1().border_color(on ? t.accent : t.border).text_color(on ? t.foreground : t.muted).when(on, (el) => el.bg(t.selected))
       .hover((s) => s.bg(t.hover)).on_click(onClick).child(text);
     const row = (bot) => {
       const config = this.configs[bot] ?? {};
+      const provider = installed.find((p) => p.id === config.provider) ?? (this.providers ?? []).find((p) => p.id === config.provider);
+      const label = Object.fromEntries(provider?.models ?? []);
       const state = this.restarting.has(bot) ? tr("다시 띄우는 중…", "Restarting…") : this.pendingRestart.has(bot) ? tr("작업 끝나면 적용", "Applies after this turn") : "";
       const isHost = this.meta.members[0] === bot;
       const small = (id, text, onClick, danger) => div().id(id).px(8).py(1).rounded(6).text_size(11.5).cursor_pointer()
@@ -217,21 +233,23 @@ export default class BotRoom extends View {
           .child(div().size(8).rounded(4).flex_none().bg(this.color(bot, t)))
           .child(div().text_size(12.5).font_semibold().text_color(this.color(bot, t)).child(this.title(bot)))
           .when(isHost, (el) => el.child(div().px(6).rounded(4).bg(t.selected).text_size(11).text_color(t.muted).child(tr("방장", "host"))))
-          .child(div().text_size(11.5).text_color(t.dim).child(`${label[config.model] ?? config.model ?? ""} · ${config.effort ?? ""}`))
+          .child(div().text_size(11.5).text_color(t.dim).child(`${provider?.label ?? config.provider ?? ""} · ${label[config.model] ?? config.model ?? ""} · ${config.effort ?? ""}`))
           .when(Boolean(state), (el) => el.child(div().text_size(11.5).text_color(t.working).child(state)))
           .child(div().flex_1())
           .when(!isHost, (el) => el.child(small(`host-${bot}`, tr("방장으로", "Make host"), (_e, cx) => cx.spawn(async (cx) => { await this.setHost(bot, cx); }))))
           .child(small(`remove-${bot}`, tr("빼기", "Remove"), (_e, cx) => cx.spawn(async (cx) => { await this.removeMember(bot, cx); }), true)))
+        .when(installed.length > 1, (el) => el.child(h_flex().gap(4).flex_wrap().pl(16)
+          .children(installed.map((p) => option(`p-${bot}-${p.id}`, p.label, config.provider === p.id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseProvider(bot, p.id, cx); }))))))
         .child(h_flex().gap(4).flex_wrap().pl(16)
-          .children(MODELS.map(([id, text]) => option(`m-${bot}-${id}`, text, config.model === id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(bot, id, config.effort ?? "low", cx); }))))
+          .children((provider?.models ?? []).map(([id, text]) => option(`m-${bot}-${id}`, text, config.model === id, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(bot, id, config.effort ?? provider.default_effort, cx); }))))
           .child(div().w(8))
-          .children(EFFORTS.map((e) => option(`e-${bot}-${e}`, e, config.effort === e, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(bot, config.model ?? "claude-sonnet-5-5", e, cx); })))));
+          .children((provider?.efforts ?? []).map((e) => option(`e-${bot}-${e}`, e, config.effort === e, (_e, cx) => cx.spawn(async (cx) => { await this.chooseModel(bot, config.model ?? provider.default_model, e, cx); })))));
     };
     return v_flex().flex_none().px(18).py(8).gap(2).border_b_1().border_color(t.border).on_mouse_down("left", keep)
       .when(this.meta.members.length === 0, (el) => el.child(div().text_size(12).text_color(t.dim).child(tr("아직 멤버가 없습니다", "No members yet"))))
       .children(this.meta.members.map(row))
-      .child(div().pt(2).text_size(11).text_color(t.dim).child(tr("모델을 고르면 그 봇을 다시 띄워 적용합니다(대화는 이어집니다). 첫 멤버가 방장으로, 멘션 없는 말을 받습니다.",
-        "Picking a model restarts that bot (the conversation continues). The first member is the host and gets messages without a mention.")));
+      .child(div().pt(2).text_size(11).text_color(t.dim).child(tr("에이전트나 모델을 고르면 그 봇을 다시 띄워 적용합니다(모델만 바꾸면 대화는 이어집니다). 첫 멤버가 방장으로, 멘션 없는 말을 받습니다.",
+        "Picking an agent or model restarts that bot (a model change continues the conversation). The first member is the host and gets messages without a mention.")));
   }
 
   async addMember(bot, cx) {

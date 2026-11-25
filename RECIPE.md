@@ -1,6 +1,6 @@
 # herdr-bots
 
-A Bots section under Spaces lists long-running Claude Code bots and rooms of bots. Clicking one opens a floating chat
+A Bots section under Spaces lists long-running agent bots (Claude Code, Codex, …) and rooms of bots. Clicking one opens a floating chat
 window that reads like a messenger: your bubbles right, the bot's Markdown replies left, its state live.
 
 ![herdr-bots](preview.png)
@@ -18,7 +18,7 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
     a bot asked `@user`. Right-click: Open, Rename, Leave room (asks once more).
   - Labels are English, or Korean when it is the first macOS language (`defaults read -g AppleLanguages`).
 - Bot chat window (`kind: "window"`, 520×680, key `chat-<bot>`): 52px header with the lamb and a status badge, title,
-  model chip, "Chats", "Terminal", `–` minimize (to 320×52) and `✕`. Messages in a 760px column with date dividers;
+  model chip (agent, model and effort), "Chats", "Terminal", `–` minimize (to 320×52) and `✕`. Messages in a 760px column with date dividers;
   your bubble `selected`, 18px radius; bot rows: 28px lamb, name, time, "Copy", a tool chip
   "▸ N tool calls · names" that unfolds one line per call; a working line; a blocked card. Composer: auto-growing textarea
   (2–8 rows), send `↑`, stop `■` while working.
@@ -56,8 +56,9 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
   `shared`/`setShared` (`bots.titles`, `bots.colors`), `exec`, `hc`, `TextView.markdown().on_link_click`,
   `TextareaState` tokens.
 - Programs: `~/.herdr-bots/bin/herdr-bot` (`hc run --keep --no-parent --label herdr.bot=<bot>`, `terminal.keep`,
-  `tab.settle`, launchd plists), `~/.herdr-bots/bin/botsdb` (Python `sqlite3`, `~/.herdr-bots/bots.db`), `claude`,
-  `alerter`.
+  `tab.settle`, launchd plists), `~/.herdr-bots/bin/botsdb` (Python `sqlite3`, `~/.herdr-bots/bots.db`),
+  `~/.herdr-bots/bin/botsagent` (per agent: start flags, session files, one parser into `{id, role, text, tools, at}`),
+  `claude` or `codex`, `alerter`.
 
 ## Watch out
 
@@ -69,6 +70,11 @@ window that reads like a messenger: your bubbles right, the bot's Markdown repli
 - Rebuilding Markdown elements every poll flickers: reuse unchanged message objects.
 - `hc send` waits about 3 s of quiet before typing; messages are typed into the bot, so expect that delay.
 - Claude Code names transcript folders after the cwd with every non-alphanumeric character turned into `-`.
+- Messages typed with `hc send` are recorded as `<hc from="…">…</hc>`, and Claude Code records a multi-line one as
+  `<pasted_content id="…">…</pasted_content id="…">`: unwrap both before looking for a room or DM marker.
+- Codex cannot take a session id up front and later compresses its rollouts to `.jsonl.zst`: find a room session by the
+  message it answered, and read closed ones with `zstd`. Start Codex with `--no-daemon` under `hc` and
+  `-c check_for_update_on_startup=false`, or the update prompt waits for a key nobody presses.
 - `claude -n` overwrites the session title; don't pass it.
 - `herdr-app check` writes `gpui-kit.d.ts` and `jsconfig.json` into the mod folder.
 - Room sessions live in the bot's folder too, so "the newest transcript" may be a room: look up the 1:1 session with

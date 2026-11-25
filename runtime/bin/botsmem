@@ -154,45 +154,25 @@ def hook_stop(db):
 
 # ── Reflection input ─────────────────────────────────────────────────
 
-def transcripts_dir(bot):
-    return os.path.expanduser("~/.claude/projects/" + "".join(c if c.isalnum() else "-" for c in bot_home(bot)))
-
-
 def conversation_since(bot, since):
-    """Conversation since the last reflection (human and bot text only), from the 1:1 and room sessions."""
-    folder = transcripts_dir(bot)
+    """Conversation since the last reflection (human and bot text only), from the 1:1 and room sessions of any agent."""
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    sys.dont_write_bytecode = True
+    loader = SourceFileLoader("botsagent", os.path.join(os.path.dirname(os.path.realpath(__file__)), "botsagent"))
+    botsagent = importlib.util.module_from_spec(importlib.util.spec_from_loader("botsagent", loader))
+    loader.exec_module(botsagent)
     entries = []
-    if not os.path.isdir(folder):
-        return entries
-    for name in os.listdir(folder):
-        path = os.path.join(folder, name)
-        if not name.endswith(".jsonl") or os.path.getmtime(path) <= since:
+    for at, m in botsagent.conversation_since(bot, since):
+        if m["role"] == "assistant":
+            text = (m.get("final") or m["text"]).strip()
+            if text:
+                entries.append((at, "bot", text))
             continue
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                if d.get("isSidechain") or d.get("isMeta") or not d.get("timestamp"):
-                    continue
-                at = datetime.datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
-                if at <= since:
-                    continue
-                content = (d.get("message") or {}).get("content")
-                if d.get("type") == "user" and isinstance(content, str) and not content.strip().startswith(("<command", "<local-command")):
-                    raw = content.strip()
-                    wrapped = raw.startswith("<hc from=")
-                    text = re.sub(r"^<hc from=\"[^\"]*\">|</hc>$", "", raw)
-                    # Owner words are only what the owner typed: not text sent from another terminal (<hc from>), room relays, DMs or schedule runs.
-                    # Reflection looks for Rule/Prefers/Decided quotes only in these (so someone else's text cannot plant an owner rule).
-                    relayed = wrapped or text.startswith(("[room:", "[방:", "[DM", "[schedule]", "[스케줄]"))
-                    entries.append((at, "relay" if relayed else "owner", text))
-                elif d.get("type") == "assistant" and isinstance(content, list):
-                    text = "\n".join(p.get("text", "") for p in content if p.get("type") == "text").strip()
-                    if text:
-                        entries.append((at, "bot", text))
-    entries.sort()
+        # Owner words are only what the owner typed: not text sent from another terminal (<hc from>), room relays, DMs or schedule runs.
+        # Reflection looks for Rule/Prefers/Decided quotes only in these (so someone else's text cannot plant an owner rule).
+        relayed = m.get("hc") or m.get("source") == "schedule" or m["text"].startswith(("[room:", "[방:", "[DM"))
+        entries.append((at, "relay" if relayed else "owner", m["text"]))
     return entries
 
 

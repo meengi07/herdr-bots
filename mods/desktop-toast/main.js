@@ -18,22 +18,11 @@ const TEXT = {
 const PUSH = '"$0" --sender dev.herdr.app --title "$1" --subtitle "$2" --message "$3" --timeout 60 --json ${6:+--content-image "$6"}'
   + ' | grep -q contentsClicked && open -b dev.herdr.app && printf "%s\\n" "$4" | while IFS="$(printf "\\t")" read -r name args; do [ -n "$name" ] && "$5" do "$name" "$args"; done';
 
-// A bot's last reply: the last assistant text of its newest transcript, Markdown stripped, on one line.
+// A bot's last reply in its 1:1 session (botsagent reads any agent's session), Markdown stripped, on one line.
 async function lastBotReply(bot) {
-  // The tail of the 1:1 transcript (room sessions excluded).
-  const found = await exec(`${home()}/.herdr-bots/bin/botsdb`, ["chat-session", bot]);
-  const file = found.code === 0 ? JSON.parse(found.stdout).file : null;
-  if (!file) return "";
-  const r = await exec("/bin/sh", ["-c", 'tail -n 200 "$1"', "_", file]);
-  for (const line of r.stdout.split("\n").reverse()) {
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
-    if (d.type !== "assistant" || !Array.isArray(d.message?.content)) continue;
-    const text = d.message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ").trim();
-    if (!text) continue;
-    return text.replace(/```[\s\S]*?```/g, " ").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[#*_`>|]/g, "").replace(/\s+/g, " ").trim().slice(0, 220);
-  }
-  return "";
+  const r = await exec(`${home()}/.herdr-bots/bin/botsagent`, ["last-reply", bot]);
+  const text = r.code === 0 ? JSON.parse(r.stdout).text : "";
+  return text.replace(/```[\s\S]*?```/g, " ").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[#*_`>|]/g, "").replace(/\s+/g, " ").trim().slice(0, 220);
 }
 
 // A bot notification opens that bot's floating chat window, which the Bots mod opens (command bots.chat-<bot>).
